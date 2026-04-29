@@ -1,0 +1,16 @@
+[project]
+name = "enterprise-agent"
+version = "0.1.0"
+description = "Enterprise-level multi-user AI Agent system with LangGraph"
+requires-python = ">=3.11"
+
+[project.scripts]
+serve = "enterprise_agent.api.main:run"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+select = ["E", "F", "I", "N"]
