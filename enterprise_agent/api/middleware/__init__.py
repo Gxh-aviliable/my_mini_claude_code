@@ -1,0 +1,1 @@
+"""API middleware module - Authentication and rate limiting"""
