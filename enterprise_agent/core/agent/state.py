@@ -22,6 +22,7 @@ class AgentState(TypedDict):
     # 上下文管理
     context_summary: Optional[str]
     token_count: int
+    transcript_path: Optional[str]  # Path to saved transcript after compression
 
     # 工具执行
     pending_tool_calls: List[Dict[str, Any]]
@@ -37,3 +38,8 @@ class AgentState(TypedDict):
     # 工作流控制
     should_compress: bool
     should_end: bool
+
+    # TodoWrite nag reminder (s03)
+    rounds_without_todo: int  # 计数：连续多少轮没有使用TodoWrite
+    used_todo_last_round: bool  # 标记：上一轮是否使用了TodoWrite
+    has_open_todos: bool  # 标记：是否有未完成的todo项
