@@ -13,9 +13,8 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 
-from langchain_anthropic import ChatAnthropic
-
 from enterprise_agent.config.settings import settings
+from enterprise_agent.core.agent.llm_factory import get_llm
 
 
 # Transcript storage directory
@@ -114,13 +113,10 @@ class ContextManager:
 
     def __init__(
         self,
-        llm: ChatAnthropic = None,
+        llm=None,
         transcript_manager: TranscriptManager = None
     ):
-        self.llm = llm or ChatAnthropic(
-            model=settings.MODEL_ID,
-            api_key=settings.ANTHROPIC_API_KEY
-        )
+        self.llm = llm or get_llm()
         self.transcript_manager = transcript_manager or TranscriptManager()
         self.token_threshold = settings.TOKEN_THRESHOLD
 

@@ -2,14 +2,16 @@
 
 Provides task tool for spawning subagents with limited tool access
 to perform isolated exploration or execution work.
+
+Supports multi-provider: Anthropic, GLM, DeepSeek, OpenAI.
 """
 
 from langchain_core.tools import tool
 from typing import Optional, List, Dict, Any
-from anthropic import Anthropic
-import os
+import asyncio
 
 from enterprise_agent.config.settings import settings
+from enterprise_agent.core.agent.llm_factory import get_llm, get_llm_for_subagent
 
 
 # Available agent types and their tool sets
@@ -17,59 +19,6 @@ AGENT_TYPES = {
     "Explore": ["bash", "read_file"],
     "general-purpose": ["bash", "read_file", "write_file", "edit_file"],
 }
-
-
-def _build_tool_schema(tool_name: str) -> Dict[str, Any]:
-    """Build tool schema for subagent."""
-    schemas = {
-        "bash": {
-            "name": "bash",
-            "description": "Run a shell command.",
-            "input_schema": {
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"]
-            }
-        },
-        "read_file": {
-            "name": "read_file",
-            "description": "Read file contents.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "limit": {"type": "integer"}
-                },
-                "required": ["path"]
-            }
-        },
-        "write_file": {
-            "name": "write_file",
-            "description": "Write content to file.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            }
-        },
-        "edit_file": {
-            "name": "edit_file",
-            "description": "Replace exact text in file.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "old_text": {"type": "string"},
-                    "new_text": {"type": "string"}
-                },
-                "required": ["path", "old_text", "new_text"]
-            }
-        },
-    }
-    return schemas.get(tool_name)
 
 
 def _execute_subagent_tool(tool_name: str, tool_input: Dict) -> str:
@@ -99,12 +48,85 @@ def _execute_subagent_tool(tool_name: str, tool_input: Dict) -> str:
         return f"Error: {e}"
 
 
+async def _run_subagent_async(prompt: str, agent_type: str) -> str:
+    """Run subagent asynchronously using LangChain.
+
+    Supports multi-provider via LLM factory.
+    """
+    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+
+    # Validate agent type
+    if agent_type not in AGENT_TYPES:
+        return f"Error: Unknown agent_type '{agent_type}'. Available: {', '.join(AGENT_TYPES.keys())}"
+
+    # Get tool names for this agent type
+    tool_names = AGENT_TYPES[agent_type]
+
+    # Build LangChain tools
+    from langchain_core.tools import Tool
+    tools = []
+    for name in tool_names:
+        if name == "bash":
+            tools.append(Tool(name="bash", func=lambda cmd: _execute_subagent_tool("bash", {"command": cmd}), description="Run shell command"))
+        elif name == "read_file":
+            tools.append(Tool(name="read_file", func=lambda path: _execute_subagent_tool("read_file", {"path": path}), description="Read file"))
+        elif name == "write_file":
+            tools.append(Tool(name="write_file", func=lambda args: _execute_subagent_tool("write_file", args), description="Write file"))
+        elif name == "edit_file":
+            tools.append(Tool(name="edit_file", func=lambda args: _execute_subagent_tool("edit_file", args), description="Edit file"))
+
+    # Get LLM and bind tools
+    try:
+        llm = get_llm()
+        llm_with_tools = llm.bind_tools(tools)
+    except Exception as e:
+        return f"Error initializing LLM: {e}"
+
+    # Subagent messages
+    messages = [HumanMessage(content=prompt)]
+
+    # Run subagent loop (max 30 rounds)
+    for _ in range(30):
+        try:
+            response = await llm_with_tools.ainvoke(messages)
+        except Exception as e:
+            return f"Subagent error: {e}"
+
+        messages.append(response)
+
+        # Check if done (no tool calls)
+        if not hasattr(response, "tool_calls") or not response.tool_calls:
+            break
+
+        # Execute tool calls
+        tool_results = []
+        for tool_call in response.tool_calls:
+            tool_name = tool_call.get("name")
+            tool_args = tool_call.get("args", {})
+            tool_id = tool_call.get("id", "")
+
+            output = _execute_subagent_tool(tool_name, tool_args)
+            tool_results.append(ToolMessage(content=output, tool_call_id=tool_id))
+
+        messages.append(HumanMessage(content=tool_results))
+
+    # Extract final summary
+    if messages and len(messages) > 0:
+        last_msg = messages[-1]
+        if hasattr(last_msg, "content"):
+            return str(last_msg.content) or "(no summary)"
+
+    return "(subagent failed)"
+
+
 @tool
 def task(prompt: str, agent_type: Optional[str] = "Explore") -> str:
     """Spawn a subagent for isolated exploration or work.
 
     The subagent operates independently with limited tool access
     and returns a summary of its work.
+
+    Supports multi-provider: Anthropic, GLM, DeepSeek, OpenAI.
 
     Args:
         prompt: The task prompt for the subagent
@@ -113,61 +135,11 @@ def task(prompt: str, agent_type: Optional[str] = "Explore") -> str:
     Returns:
         Summary of subagent's work
     """
-    # Validate agent type
-    if agent_type not in AGENT_TYPES:
-        return f"Error: Unknown agent_type '{agent_type}'. Available: {', '.join(AGENT_TYPES.keys())}"
-
-    # Get tools for this agent type
-    tool_names = AGENT_TYPES[agent_type]
-    tools = [_build_tool_schema(t) for t in tool_names if _build_tool_schema(t)]
-
-    # Initialize Anthropic client
-    client = Anthropic(
-        api_key=settings.ANTHROPIC_API_KEY,
-        base_url=os.getenv("ANTHROPIC_BASE_URL")
-    )
-
-    # Subagent messages
-    sub_messages = [{"role": "user", "content": prompt}]
-
-    # Run subagent loop (max 30 rounds)
-    response = None
-    for _ in range(30):
-        try:
-            response = client.messages.create(
-                model=settings.MODEL_ID,
-                messages=sub_messages,
-                tools=tools,
-                max_tokens=8000
-            )
-        except Exception as e:
-            return f"Subagent error: {e}"
-
-        sub_messages.append({"role": "assistant", "content": response.content})
-
-        # Check if done
-        if response.stop_reason != "tool_use":
-            break
-
-        # Execute tool calls
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                output = _execute_subagent_tool(block.name, block.input)
-                results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output
-                })
-
-        sub_messages.append({"role": "user", "content": results})
-
-    # Extract final summary
-    if response:
-        summary_parts = []
-        for block in response.content:
-            if hasattr(block, "text"):
-                summary_parts.append(block.text)
-        return "".join(summary_parts) or "(no summary)"
-
-    return "(subagent failed)"
+    # Run async subagent in sync context
+    try:
+        loop = asyncio.get_running_loop()
+        # Already in async context - create task
+        return asyncio.create_task(_run_subagent_async(prompt, agent_type or "Explore"))
+    except RuntimeError:
+        # No running loop - run directly
+        return asyncio.run(_run_subagent_async(prompt, agent_type or "Explore"))

@@ -323,14 +323,11 @@ class TeammateRunner:
 
     async def _work_phase(self) -> None:
         """Work phase: process messages and use tools."""
-        from langchain_anthropic import ChatAnthropic
         from enterprise_agent.core.agent.tools import ALL_TOOLS
         from enterprise_agent.core.agent.context import get_context_manager
+        from enterprise_agent.core.agent.llm_factory import get_llm
 
-        llm = ChatAnthropic(
-            model=settings.MODEL_ID,
-            api_key=settings.ANTHROPIC_API_KEY
-        )
+        llm = get_llm()
         llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
         ctx_mgr = get_context_manager()

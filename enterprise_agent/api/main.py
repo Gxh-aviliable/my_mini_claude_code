@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from enterprise_agent.config.settings import settings
 from enterprise_agent.db.mysql import close_db
 from enterprise_agent.db.redis import close_redis
+from enterprise_agent.db.chroma import init_chroma
 from enterprise_agent.api.routes.auth import router as auth_router
 from enterprise_agent.api.routes.chat import router as chat_router
 from enterprise_agent.api.routes.chat import sessions_router
@@ -14,6 +15,8 @@ from enterprise_agent.api.routes.chat import sessions_router
 async def lifespan(app: FastAPI):
     """Application lifespan - startup and shutdown"""
     # Startup
+    # Initialize Chroma vector database
+    init_chroma()
     yield
     # Shutdown
     await close_db()

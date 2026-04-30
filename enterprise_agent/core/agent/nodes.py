@@ -13,20 +13,17 @@ Node flow:
 import json
 from typing import Dict, Any, List
 
-from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
 
 from enterprise_agent.core.agent.state import AgentState
 from enterprise_agent.core.agent.tools import ALL_TOOLS
 from enterprise_agent.core.agent.context import get_context_manager, get_transcript_manager
+from enterprise_agent.core.agent.llm_factory import get_llm
 from enterprise_agent.config.settings import settings
 
 
-# Initialize LLM
-llm = ChatAnthropic(
-    model=settings.MODEL_ID,
-    api_key=settings.ANTHROPIC_API_KEY
-)
+# Initialize LLM using factory (supports Anthropic, GLM, DeepSeek, OpenAI)
+llm = get_llm()
 
 # Bind tools to LLM
 llm_with_tools = llm.bind_tools(ALL_TOOLS)
