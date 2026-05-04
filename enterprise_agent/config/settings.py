@@ -76,6 +76,7 @@ class Settings(BaseSettings):
             "glm": "https://open.bigmodel.cn/api/paas/v4",
             "deepseek": "https://api.deepseek.com",
             "openai": "https://api.openai.com/v1",
+            "mimo": "https://api.xiaomimimo.com/anthropic",
         }
         return defaults.get(self.LLM_PROVIDER)
 

@@ -21,6 +21,17 @@ def _get_anthropic_llm() -> BaseChatModel:
     )
 
 
+def _get_mimo_llm() -> BaseChatModel:
+    """Create MiMo LLM via Anthropic-compatible API."""
+    from langchain_anthropic import ChatAnthropic
+
+    return ChatAnthropic(
+        model=settings.get_effective_model_id(),
+        api_key=settings.get_effective_api_key(),
+        base_url=settings.get_effective_base_url(),
+    )
+
+
 def _get_openai_compatible_llm(provider: str) -> BaseChatModel:
     """Create OpenAI-compatible LLM (GLM, DeepSeek, OpenAI)."""
     from langchain_openai import ChatOpenAI
@@ -58,6 +69,7 @@ def get_llm() -> BaseChatModel:
         "glm": lambda: _get_openai_compatible_llm("glm"),
         "deepseek": lambda: _get_openai_compatible_llm("deepseek"),
         "openai": lambda: _get_openai_compatible_llm("openai"),
+        "mimo": _get_mimo_llm,
     }
 
     if provider not in providers:
@@ -115,6 +127,13 @@ PROVIDER_INFO = {
         "tool_support": True,
         "embedding_support": True,
         "base_url": "https://api.openai.com/v1",
+    },
+    "mimo": {
+        "name": "MiMo",
+        "models": ["mimo-v2.5-pro"],
+        "tool_support": True,
+        "embedding_support": False,
+        "base_url": "https://api.xiaomimimo.com/anthropic",
     },
 }
 

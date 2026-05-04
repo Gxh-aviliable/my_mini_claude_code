@@ -43,18 +43,19 @@
 
 | 序号 | 文件 | 说明 |
 |------|------|------|
-| 1 | `config/settings.py` | 所有配置项、环境变量、阈值 |
-| 2 | `api/main.py` | FastAPI 入口，路由注册，lifespan 启动流程 |
+| 1 | `config/settings.py` | 所有配置项、多模型配置、Chroma 配置 |
+| 2 | `api/main.py` | FastAPI 入口，路由注册，lifespan 启动 Chroma |
 
 ### 阅读重点
 
 **settings.py**：
-- 了解有哪些配置类别：JWT、Database、Redis、LLM、Memory
-- 重点看 `TOKEN_THRESHOLD`（压缩阈值）、`MODEL_ID`（模型选择）
+- 了解多模型配置：`LLM_PROVIDER`, `LLM_API_KEY`, `MODEL_ID`
+- 了解 Chroma 配置：`CHROMA_PERSIST_DIR`, `EMBEDDING_MODEL`
+- 重点看 `get_effective_api_key()`, `get_effective_base_url()`, `get_effective_model_id()`
 - 理解 Pydantic BaseSettings 如何从 `.env` 加载配置
 
 **main.py**：
-- 看 `lifespan()` 函数如何初始化数据库连接池
+- 看 `lifespan()` 函数如何初始化 Chroma (`init_chroma()`)
 - 理解路由注册顺序：auth → chat → sessions
 - 看 CORS、中间件的配置
 
@@ -69,6 +70,7 @@
 | 3 | `core/agent/state.py` | AgentState 状态定义 |
 | 4 | `core/agent/graph.py` | LangGraph 工作流构建 |
 | 5 | `core/agent/nodes.py` | 节点函数具体实现 |
+| 6 | `core/agent/llm_factory.py` | **新增** LLM 工厂函数（多模型支持） |
 
 ### 阅读顺序
 
@@ -153,12 +155,38 @@ def build_agent_graph():
 | 3 | `check_background_node` | 注入后台任务通知 | BackgroundManager.drain_notifications() |
 | 4 | `check_inbox_node` | 注入 inbox 消息 | AsyncMessageBus.read_inbox("lead") |
 | 5 | `pre_llm_microcompact_node` | 清理旧工具结果 | ContextManager.microcompact(keep_last=3) |
-| 6 | `llm_call_node` | 核心：调用 LLM | llm_with_tools.ainvoke()，提取 tool_calls |
+| 6 | `llm_call_node` | 核心：调用 LLM | **使用 get_llm()**，llm_with_tools.ainvoke() |
 | 7 | `tool_executor_node` | 执行工具调用 | 遍历 pending_tool_calls，追踪 todo_update 使用 |
 | 8 | `save_memory_node` | 保存 + nag reminder | stm.append_message()，TodoWrite 提醒逻辑 |
 | 9 | `compress_context_node` | 自动压缩 | token_count > threshold 时触发 |
 | 10 | `route_after_llm` | 条件路由 | pending_tool_calls → tool_executor，threshold → compress |
 | 11 | `route_after_tool` | 工具后路由 | should_compress → manual_compress，否则 → llm_call |
+
+**重点理解多模型支持**：
+```python
+# nodes.py 第 16-22 行
+from enterprise_agent.core.agent.llm_factory import get_llm
+
+llm = get_llm()  # 根据 LLM_PROVIDER 返回对应的模型
+llm_with_tools = llm.bind_tools(ALL_TOOLS)
+```
+
+---
+
+#### 4. llm_factory.py → 多模型工厂（新增）
+
+```python
+def get_llm() -> BaseChatModel:
+    """根据 LLM_PROVIDER 配置返回对应的 LLM"""
+    provider = settings.LLM_PROVIDER
+
+    if provider == "anthropic":
+        return ChatAnthropic(...)
+    elif provider == "glm":
+        return ChatOpenAI(base_url="https://open.bigmodel.cn/api/paas/v4", ...)
+    elif provider == "deepseek":
+        return ChatOpenAI(base_url="https://api.deepseek.com", ...)
+```
 
 ---
 

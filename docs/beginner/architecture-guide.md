@@ -34,25 +34,32 @@
 │  │   └─────────┘    └─────────┘    │ llm     │                        │    │
 │  │                                  └─────────┘                        │    │
 │  │   + Tool Registry: file_ops, shell, task, subagent, background,    │    │
-│  │                     skills, team                                  │    │
+│  │                     skills, team, context_tools                    │    │
+│  │   + LLM Factory: Anthropic, GLM, DeepSeek, OpenAI                  │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 │                                     │                                        │
 │  ┌───────────────────┐  ┌───────────────────────────────────────────┐      │
 │  │   Memory Layer    │  │           Data Layer                      │      │
 │  │  ┌─────────────┐  │  │  ┌─────────────┐  ┌───────────────────┐   │      │
 │  │  │ Short Term  │  │  │  │ MySQL       │  │ Redis             │   │      │
-│  │  │ (Redis)     │  │  │  │ (Long Term) │  │ (Session Cache)   │   │      │
+│  │  │ (Redis)     │  │  │  │ (Auth only) │  │ (Session Cache)   │   │      │
 │  │  │ - messages  │  │  │  │ - User      │  │ - messages        │   │      │
 │  │  │ - state     │  │  │  │ - Session   │  │ - state           │   │      │
-│  │  │ - locks     │  │  │  │ - Conversation│  │ - tool cache   │   │      │
-│  │  └─────────────┘  │  │  │ - Patterns  │  │ - locks           │   │      │
-│  └───────────────────┘  │  │ - Tool Logs │  └───────────────────┘   │      │
-│                         │  └─────────────┘                           │      │
-│                         └───────────────────────────────────────────┘      │
+│  │  │ - locks     │  │  │  │ - APIKey    │  │ - tool cache      │   │      │
+│  │  └─────────────┘  │  │  │ - ToolLogs  │  │ - locks           │   │      │
+│  │  ┌─────────────┐  │  │  └─────────────┘  └───────────────────┘   │      │
+│  │  │ Long Term   │  │  │                                           │      │
+│  │  │ (Chroma)    │  │  │                                           │      │
+│  │  │ - conversations│  │                                           │      │
+│  │  │ - patterns │  │  │                                           │      │
+│  │  │ - semantic │  │  │                                           │      │
+│  │  │   search   │  │  │                                           │      │
+│  │  └─────────────┘  │  │                                           │      │
+│  └───────────────────┘  └───────────────────────────────────────────┘      │
 │                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │                     Config Layer (Pydantic Settings)                 │    │
-│  │  Settings: JWT, DB, Redis, LLM, Memory thresholds                    │    │
+│  │  Settings: JWT, DB, Redis, LLM_PROVIDER, Chroma, Memory thresholds  │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -64,7 +71,7 @@
 ```
 enterprise_agent/
 ├── api/                    # FastAPI 接口层
-│   ├── main.py             # 应用入口、路由注册、lifespan
+│   ├── main.py             # 应用入口、路由注册、lifespan (初始化 Chroma)
 │   ├── middleware/
 │   │   └── auth.py         # JWT 认证中间件
 │   ├── routes/
@@ -77,39 +84,43 @@ enterprise_agent/
 ├── core/agent/             # LangGraph 核心引擎
 │   ├── state.py            # AgentState TypedDict (消息、任务、工具状态)
 │   ├── graph.py            # StateGraph 构建、节点连接、条件路由
-│   ├── nodes.py            # 6 个节点函数: init/load/llm/tool/save/compress
+│   ├── nodes.py            # 11 个节点函数 (使用 get_llm())
+│   ├── llm_factory.py      # **新增** LLM 工厂函数 (多模型支持)
+│   ├── context.py          # ContextManager + TranscriptManager
 │   └── tools/              # 工具注册
 │       ├── __init__.py     # ALL_TOOLS 汇总 + 权限过滤
 │       ├── file_ops.py     # read_file, write_file, edit_file
 │       ├── shell.py        # bash
 │       ├── task.py         # todo_update, task_create/get/update/list, claim
-│       ├── subagent.py     # task (委托子代理)
+│       ├── subagent.py     # task (子代理，支持多模型)
 │       ├── background.py   # background_run, check_background
 │       ├── skills.py       # load_skill, list_skills, reload_skills
+│       ├── context_tools.py # compress, list_transcripts, context_status
 │       └── team.py         # spawn_teammate, send_message, broadcast, etc.
 │
 ├── memory/                 # 记忆管理
 │   ├── base.py             # MemoryBase 抽象接口
-│   └── short_term.py       # ShortTermMemory (Redis)
+│   ├── short_term.py       # ShortTermMemory (Redis)
+│   └── long_term.py        # **新增** ChromaLongTermMemory (向量数据库)
 │
 ├── auth/                   # 认证授权
 │   ├── jwt_handler.py      # JWT 创建/验证、密码哈希
 │   └── permissions.py      # 权限定义
 │
-├── models/                 # SQLAlchemy ORM 模型
+├── models/                 # SQLAlchemy ORM 模型 (仅认证相关)
 │   ├── user.py             # User 表
 │   ├── session.py          # Session 表
-│   ├── conversation.py     # ConversationMessage 表
-│   ├── user_pattern.py     # UserPreference, UserPattern
 │   ├── tool_usage.py       # ToolUsageLog
 │   └── api_key.py          # APIKey
+│   # 注意: conversation.py, user_pattern.py 已删除，改用 Chroma
 │
 ├── db/                     # 数据库连接
 │   ├── mysql.py            # AsyncEngine, session_factory, get_db()
-│   └── redis.py            # Redis connection pool, get_redis()
+│   ├── redis.py            # Redis connection pool, get_redis()
+│   └── chroma.py           # **新增** Chroma 客户端初始化
 │
 ├── config/
-│   └── settings.py         # Pydantic Settings (.env 配置)
+│   └── settings.py         # Pydantic Settings (多模型配置)
 │
 └── utils/
 ```
@@ -262,27 +273,31 @@ permission_map = {
 │                                                            │
 │  ┌─────────────────────┐     ┌─────────────────────────┐  │
 │  │   Short Term        │     │      Long Term          │  │
-│  │   (Redis)           │     │      (MySQL)            │  │
+│  │   (Redis)           │     │      (Chroma)           │  │
 │  │                     │     │                         │  │
 │  │   TTL: 24h          │     │   Persistent            │  │
-│  │   Max: 100 msgs     │     │                         │  │
-│  │                     │     │   Tables:               │  │
-│  │   Keys:             │     │   - User                │  │
-│  │   session:{id}:     │     │   - Session             │  │
-│  │     messages        │     │   - ConversationMessage │  │
-│  │     state           │     │   - UserPreference      │  │
-│  │     tools_cache     │     │   - UserPattern         │  │
-│  │   lock:session:{id} │     │   - ToolUsageLog        │  │
-│  │                     │     │   - APIKey              │  │
+│  │   Max: 100 msgs     │     │   + Semantic Search     │  │
+│  │                     │     │                         │  │
+│  │   Keys:             │     │   Collections:          │  │
+│  │   session:{id}:     │     │   - conversations       │  │
+│  │     messages        │     │     (对话历史+向量搜索) │  │
+│  │     state           │     │   - user_patterns       │  │
+│  │     tools_cache     │     │     (用户行为模式)     │  │
+│  │   lock:session:{id} │     │                         │  │
+│  │                     │     │   Embedding:            │  │
+│  │                     │     │   all-MiniLM-L6-v2      │  │
+│  │                     │     │   (本地模型,无需API)    │  │
 │  └─────────────────────┘     └─────────────────────────┘  │
 │                                                            │
 │  Flow:                                                     │
 │  Request → load_memory (Redis) → Process → save_memory    │
-│         → Periodic sync to MySQL (长期记忆)               │
+│         → store to Chroma (长期记忆+语义搜索)             │
+│                                                            │
+│  Note: MySQL 仅用于认证 (User, Session, APIKey, ToolLogs) │
 └────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 ShortTermMemory 类
+### 6.2 ShortTermMemory 类 (Redis)
 
 | 方法 | 功能 |
 |------|------|
@@ -295,6 +310,17 @@ permission_map = {
 | `release_lock()` | 释放会话锁 |
 | `cache_tool_result()` | 缓存工具执行结果 |
 | `get_cached_tool_result()` | 获取缓存的工具结果 |
+
+### 6.3 ChromaLongTermMemory 类 (新增)
+
+| 方法 | 功能 |
+|------|------|
+| `store_conversation()` | 存储对话消息 (带 embedding) |
+| `search_conversations()` | **语义搜索**对话历史 |
+| `get_session_history()` | 获取会话所有消息 |
+| `store_pattern()` | 存储用户行为模式 |
+| `search_patterns()` | **语义搜索**用户模式 |
+| `get_all_patterns()` | 获取用户所有模式 |
 
 ---
 
@@ -391,13 +417,15 @@ permission_map = {
 | 技术 | 用途 |
 |------|------|
 | **LangGraph** | 有状态 AI 工作流图 |
-| **LangChain** | LLM 抽象 + 工具绑定 |
+| **LangChain** | LLM 抽象 + 工具绑定 + 多模型支持 |
 | **FastAPI** | 异步 REST API |
 | **Redis** | 短期记忆缓存 (消息、状态、锁) |
-| **MySQL** | 长期持久化 (用户、会话、模式) |
+| **Chroma** | 长期向量记忆 (语义搜索) |
+| **MySQL** | 用户认证 + 会话管理 (仅 Auth) |
 | **JWT** | 认证 + 权限控制 |
 | **Pydantic** | 配置 + 数据验证 |
 | **SQLAlchemy 2.0** | 异步 ORM |
+| **sentence-transformers** | 本地 Embedding 模型 |
 
 ---
 
@@ -416,27 +444,35 @@ class Settings(BaseSettings):
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
 
-    # MySQL
+    # MySQL (仅认证)
     MYSQL_HOST: str = "localhost"
     MYSQL_PORT: int = 3306
     MYSQL_USER: str = "agent_user"
     MYSQL_PASSWORD: str = ""
     MYSQL_DATABASE: str = "enterprise_agent"
 
-    # Redis
+    # Redis (短期记忆)
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
     REDIS_PASSWORD: Optional[str] = None
+
+    # Chroma (长期向量记忆)
+    CHROMA_PERSIST_DIR: str = "./chroma_data"
+    CHROMA_COLLECTION_CONVERSATIONS: str = "conversations"
+    CHROMA_COLLECTION_PATTERNS: str = "user_patterns"
+    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+
+    # LLM Provider (多模型支持)
+    LLM_PROVIDER: str = "anthropic"  # anthropic | glm | deepseek | openai
+    LLM_API_KEY: str = ""
+    LLM_BASE_URL: Optional[str] = None
+    MODEL_ID: str = "claude-sonnet-4-6"
 
     # JWT
     JWT_SECRET_KEY: str = "change-me-in-production"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
-
-    # LLM
-    ANTHROPIC_API_KEY: str = ""
-    MODEL_ID: str = "claude-sonnet-4-6"
 
     # Memory
     SHORT_TERM_TTL_HOURS: int = 24
@@ -447,15 +483,148 @@ class Settings(BaseSettings):
 ### 11.2 环境变量 (.env)
 
 ```bash
-# 必填
-ANTHROPIC_API_KEY=your-api-key
+# === LLM Provider ===
+# 选择提供商: anthropic, glm, deepseek, openai
+LLM_PROVIDER=anthropic
+
+# API Key (通用)
+LLM_API_KEY=your-api-key
+
+# 模型 ID (可选，有默认值)
+MODEL_ID=claude-sonnet-4-6
+
+# === 数据库 ===
 MYSQL_PASSWORD=your-db-password
+REDIS_PASSWORD=
+
+# === Chroma ===
+CHROMA_PERSIST_DIR=./chroma_data
+
+# === 安全 ===
 JWT_SECRET_KEY=your-secret-key
 
-# 可选
+# === 可选 ===
 DEBUG=true
 API_PORT=8000
-REDIS_PASSWORD=
+
+# === 多模型配置示例 ===
+# 使用 GLM-4
+# LLM_PROVIDER=glm
+# LLM_API_KEY=your-glm-key
+# MODEL_ID=glm-4
+
+# 使用 DeepSeek
+# LLM_PROVIDER=deepseek
+# LLM_API_KEY=your-deepseek-key
+# MODEL_ID=deepseek-chat
+```
+
+---
+
+## 12. 多模型支持 (新增)
+
+### 12.1 支持的模型提供商
+
+| 提供商 | LLM_PROVIDER 值 | API 格式 | 工具调用 | 默认模型 |
+|--------|-----------------|----------|----------|----------|
+| Anthropic | `anthropic` | Native | ✅ | claude-sonnet-4-6 |
+| GLM (智谱) | `glm` | OpenAI兼容 | ✅ | glm-4 |
+| DeepSeek | `deepseek` | OpenAI兼容 | ✅ | deepseek-chat |
+| OpenAI | `openai` | Native | ✅ | gpt-4 |
+
+### 12.2 LLM Factory
+
+```python
+# core/agent/llm_factory.py
+def get_llm() -> BaseChatModel:
+    """根据 LLM_PROVIDER 配置返回对应的 LLM 实例"""
+    provider = settings.LLM_PROVIDER
+
+    if provider == "anthropic":
+        return ChatAnthropic(model=settings.MODEL_ID, api_key=settings.LLM_API_KEY)
+
+    elif provider == "glm":
+        return ChatOpenAI(
+            model=settings.MODEL_ID or "glm-4",
+            api_key=settings.LLM_API_KEY,
+            base_url="https://open.bigmodel.cn/api/paas/v4"
+        )
+
+    elif provider == "deepseek":
+        return ChatOpenAI(
+            model=settings.MODEL_ID or "deepseek-chat",
+            api_key=settings.LLM_API_KEY,
+            base_url="https://api.deepseek.com"
+        )
+```
+
+### 12.3 使用位置
+
+| 文件 | 使用方式 |
+|------|----------|
+| `nodes.py` | `llm = get_llm()` |
+| `context.py` | `self.llm = get_llm()` |
+| `team.py` | `llm = get_llm()` |
+| `subagent.py` | `llm = get_llm()` |
+
+---
+
+## 13. Chroma 向量数据库 (新增)
+
+### 13.1 架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Chroma Vector Database                    │
+│                                                             │
+│  Collections:                                               │
+│  ┌─────────────────────┐                                    │
+│  │ conversations       │  对话历史 + 语义搜索               │
+│  │ - metadata: user_id │                                    │
+│  │ - embedding: text   │                                    │
+│  │ - semantic search   │                                    │
+│  └─────────────────────┘                                    │
+│                                                             │
+│  ┌─────────────────────┐                                    │
+│  │ user_patterns       │  用户行为模式                      │
+│  │ - pattern_type      │                                    │
+│  │ - pattern_key       │                                    │
+│  │ - embedding: pattern│                                    │
+│  └─────────────────────┘                                    │
+│                                                             │
+│  Embedding Model:                                           │
+│  - all-MiniLM-L6-v2 (本地 sentence-transformers)            │
+│  - 无需 API Key                                             │
+│  - 384 维向量                                               │
+│                                                             │
+│  Persistence:                                               │
+│  - ./chroma_data/                                           │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 13.2 关键文件
+
+| 文件 | 功能 |
+|------|------|
+| `db/chroma.py` | Chroma 客户端初始化、Collection 管理 |
+| `memory/long_term.py` | ChromaLongTermMemory 类、语义搜索 |
+| `api/main.py` | lifespan 中调用 `init_chroma()` |
+
+### 13.3 语义搜索示例
+
+```python
+# 搜索相关对话
+results = await long_term_memory.search_conversations(
+    query="如何实现上下文压缩",
+    n_results=10,
+)
+
+# 搜索用户模式
+patterns = await long_term_memory.search_patterns(
+    query="用户偏好的工具",
+    pattern_type="preference",
+)
 ```
 
 ---
