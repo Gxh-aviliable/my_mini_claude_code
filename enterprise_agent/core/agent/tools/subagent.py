@@ -6,18 +6,44 @@ to perform isolated exploration or execution work.
 Supports multi-provider: Anthropic, GLM, DeepSeek, OpenAI.
 """
 
+from typing import Dict, Optional
+
 from langchain_core.tools import tool
-from typing import Optional, List, Dict, Any
-import asyncio
 
 from enterprise_agent.config.settings import settings
-from enterprise_agent.core.agent.llm_factory import get_llm, get_llm_for_subagent
-
+from enterprise_agent.core.agent.llm_factory import get_llm
 
 # Available agent types and their tool sets
 AGENT_TYPES = {
     "Explore": ["bash", "read_file"],
     "general-purpose": ["bash", "read_file", "write_file", "edit_file"],
+}
+
+# System prompts for each agent type
+SUBAGENT_SYSTEM_PROMPTS = {
+    "Explore": """You are an exploration agent. Your job is to quickly search and understand codebases.
+
+## Capabilities
+- Run shell commands (read-only: grep, find, ls, cat, etc.)
+- Read files to understand their content
+
+## Guidelines
+- Be fast and focused — find the answer and report back
+- Use grep/find to locate relevant files before reading them
+- Summarize your findings clearly and concisely
+- Do NOT modify any files — you are read-only""",
+
+    "general-purpose": """You are a general-purpose agent capable of reading and writing code.
+
+## Capabilities
+- Run shell commands
+- Read, write, and edit files
+
+## Guidelines
+- Complete the task described in the prompt
+- Be careful with file modifications — read before editing
+- Report a clear summary of what you did
+- If you encounter errors, try to fix them before reporting failure""",
 }
 
 
@@ -26,7 +52,7 @@ def _execute_subagent_tool(tool_name: str, tool_input: Dict) -> str:
 
     Uses the actual tool implementations from other modules.
     """
-    from enterprise_agent.core.agent.tools.file_ops import read_file, write_file, edit_file
+    from enterprise_agent.core.agent.tools.file_ops import edit_file, read_file, write_file
     from enterprise_agent.core.agent.tools.shell import bash
 
     tool_map = {
@@ -43,7 +69,7 @@ def _execute_subagent_tool(tool_name: str, tool_input: Dict) -> str:
     # Execute the tool
     try:
         result = tool.invoke(tool_input)
-        return str(result)[:50000]  # Limit output size
+        return str(result)[:settings.TOOL_OUTPUT_MAX_CHARS]
     except Exception as e:
         return f"Error: {e}"
 
@@ -53,7 +79,7 @@ async def _run_subagent_async(prompt: str, agent_type: str) -> str:
 
     Supports multi-provider via LLM factory.
     """
-    from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
+    from langchain_core.messages import HumanMessage, SystemMessage, ToolMessage
 
     # Validate agent type
     if agent_type not in AGENT_TYPES:
@@ -67,13 +93,29 @@ async def _run_subagent_async(prompt: str, agent_type: str) -> str:
     tools = []
     for name in tool_names:
         if name == "bash":
-            tools.append(Tool(name="bash", func=lambda cmd: _execute_subagent_tool("bash", {"command": cmd}), description="Run shell command"))
+            tools.append(Tool(
+                name="bash",
+                func=lambda cmd: _execute_subagent_tool("bash", {"command": cmd}),
+                description="Run shell command",
+            ))
         elif name == "read_file":
-            tools.append(Tool(name="read_file", func=lambda path: _execute_subagent_tool("read_file", {"path": path}), description="Read file"))
+            tools.append(Tool(
+                name="read_file",
+                func=lambda path: _execute_subagent_tool("read_file", {"path": path}),
+                description="Read file",
+            ))
         elif name == "write_file":
-            tools.append(Tool(name="write_file", func=lambda args: _execute_subagent_tool("write_file", args), description="Write file"))
+            tools.append(Tool(
+                name="write_file",
+                func=lambda args: _execute_subagent_tool("write_file", args),
+                description="Write file",
+            ))
         elif name == "edit_file":
-            tools.append(Tool(name="edit_file", func=lambda args: _execute_subagent_tool("edit_file", args), description="Edit file"))
+            tools.append(Tool(
+                name="edit_file",
+                func=lambda args: _execute_subagent_tool("edit_file", args),
+                description="Edit file",
+            ))
 
     # Get LLM and bind tools
     try:
@@ -82,11 +124,15 @@ async def _run_subagent_async(prompt: str, agent_type: str) -> str:
     except Exception as e:
         return f"Error initializing LLM: {e}"
 
-    # Subagent messages
-    messages = [HumanMessage(content=prompt)]
+    # Subagent messages with system prompt
+    system_prompt = SUBAGENT_SYSTEM_PROMPTS.get(agent_type, "")
+    messages = []
+    if system_prompt:
+        messages.append(SystemMessage(content=system_prompt))
+    messages.append(HumanMessage(content=prompt))
 
-    # Run subagent loop (max 30 rounds)
-    for _ in range(30):
+    # Run subagent loop
+    for _ in range(settings.SUBAGENT_MAX_ROUNDS):
         try:
             response = await llm_with_tools.ainvoke(messages)
         except Exception as e:
@@ -108,7 +154,7 @@ async def _run_subagent_async(prompt: str, agent_type: str) -> str:
             output = _execute_subagent_tool(tool_name, tool_args)
             tool_results.append(ToolMessage(content=output, tool_call_id=tool_id))
 
-        messages.append(HumanMessage(content=tool_results))
+        messages.extend(tool_results)
 
     # Extract final summary
     if messages and len(messages) > 0:
@@ -120,7 +166,7 @@ async def _run_subagent_async(prompt: str, agent_type: str) -> str:
 
 
 @tool
-def task(prompt: str, agent_type: Optional[str] = "Explore") -> str:
+async def task(prompt: str, agent_type: Optional[str] = "Explore") -> str:
     """Spawn a subagent for isolated exploration or work.
 
     The subagent operates independently with limited tool access
@@ -135,11 +181,4 @@ def task(prompt: str, agent_type: Optional[str] = "Explore") -> str:
     Returns:
         Summary of subagent's work
     """
-    # Run async subagent in sync context
-    try:
-        loop = asyncio.get_running_loop()
-        # Already in async context - create task
-        return asyncio.create_task(_run_subagent_async(prompt, agent_type or "Explore"))
-    except RuntimeError:
-        # No running loop - run directly
-        return asyncio.run(_run_subagent_async(prompt, agent_type or "Explore"))
+    return await _run_subagent_async(prompt, agent_type or "Explore")

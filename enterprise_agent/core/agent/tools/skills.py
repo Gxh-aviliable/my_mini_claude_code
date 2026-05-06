@@ -5,10 +5,11 @@ Each skill has YAML frontmatter with metadata (name, description)
 and markdown body with the skill content.
 """
 
-from langchain_core.tools import tool
-from pathlib import Path
 import re
+from pathlib import Path
 from typing import Dict, Optional
+
+from langchain_core.tools import tool
 
 
 class SkillLoader:
@@ -57,8 +58,9 @@ class SkillLoader:
                 "body": body,
                 "path": str(skill_file)
             }
-        except Exception:
-            pass  # Skip invalid skill files
+        except Exception as e:
+            import logging
+            logging.warning("Failed to load skill %s: %s", skill_file, e)
 
     def descriptions(self) -> str:
         """Get formatted list of skill descriptions."""
@@ -111,6 +113,7 @@ _skill_loader: Optional[SkillLoader] = None
 
 def get_skill_loader() -> SkillLoader:
     """Get or create SkillLoader instance."""
+    global _skill_loader
     if _skill_loader is None:
         _skill_loader = SkillLoader()
     return _skill_loader

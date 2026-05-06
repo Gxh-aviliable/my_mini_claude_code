@@ -4,58 +4,107 @@ Each node is an async function that takes state and returns state updates.
 Nodes are connected in a StateGraph workflow defined in graph.py.
 
 Node flow:
-    init_context -> load_memory -> llm_call -> route_after_llm
-                                            -> tool_executor -> save_memory -> llm_call
-                                            -> compress_context -> llm_call
-                                            -> END
+    init_context -> check_background -> check_inbox -> pre_microcompact -> llm_call
+                                                                              |
+                         +----------------------------------------------------+
+                         |                    |                               |
+                    tool_executor         compress_context                END
+                         |                    |
+                    save_memory          llm_call
+                         |
+                    route_after_tool
+                         |
+               +---------+---------+
+               |                   |
+          compress_context      llm_call
+
+State persistence (messages, todos, etc.) is handled automatically by
+RedisSaver checkpointer — no manual message loading/saving needed.
 """
 
 import json
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
-from langchain_core.messages import HumanMessage, AIMessage, ToolMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
+from enterprise_agent.config.settings import settings
+from enterprise_agent.core.agent.context import get_context_manager
+from enterprise_agent.core.agent.llm_factory import get_llm
 from enterprise_agent.core.agent.state import AgentState
 from enterprise_agent.core.agent.tools import ALL_TOOLS
-from enterprise_agent.core.agent.context import get_context_manager, get_transcript_manager
-from enterprise_agent.core.agent.llm_factory import get_llm
-from enterprise_agent.config.settings import settings
+
+# System prompts for different agent roles
+MAIN_SYSTEM_PROMPT = """You are an enterprise-grade AI assistant with access to powerful tools.
+
+## Capabilities
+- **Shell execution**: Run commands via `bash` tool
+- **File operations**: Read, write, and edit files
+- **Task management**: Create and track TODO items with `todo_update`
+- **Team coordination**: Spawn and manage teammate agents
+- **Background tasks**: Run long-running commands asynchronously
+- **Context compression**: Compress conversation history when it gets too long
+
+## Guidelines
+1. Use tools when needed to accomplish tasks — don't just describe what to do
+2. Manage your work with TODO items for multi-step tasks
+3. Be concise and direct in your responses
+4. When spawning teammates, provide clear role descriptions and prompts
+5. Use background tasks for long-running operations
+6. If context gets too long, use the `compress` tool to summarize and continue"""
+
+# Lazy LLM initialization (avoids crash at import time if API key not set)
+_llm = None
+_llm_with_tools = None
 
 
-# Initialize LLM using factory (supports Anthropic, GLM, DeepSeek, OpenAI)
-llm = get_llm()
+def get_llm_with_tools():
+    """Get LLM with tools bound (lazy initialization)."""
+    global _llm, _llm_with_tools
+    if _llm is None:
+        _llm = get_llm()
+        _llm_with_tools = _llm.bind_tools(ALL_TOOLS)
+    return _llm_with_tools
 
-# Bind tools to LLM
-llm_with_tools = llm.bind_tools(ALL_TOOLS)
 
+def _convert_to_langchain_messages(messages: List[Any]) -> List[Any]:
+    """Convert messages to LangChain message objects.
 
-def _convert_to_langchain_messages(messages: List[Dict]) -> List[Any]:
-    """Convert dict messages to LangChain message objects.
+    Handles both dict messages and existing LangChain message objects.
 
     Args:
-        messages: List of message dicts
+        messages: List of message dicts or LangChain message objects
 
     Returns:
         List of LangChain message objects
     """
     result = []
     for msg in messages:
-        role = msg.get("role", "user")
-        content = msg.get("content", "")
+        # If already a LangChain message, use it directly
+        if hasattr(msg, "type") and hasattr(msg, "content"):
+            result.append(msg)
+            continue
 
-        if role == "user":
-            result.append(HumanMessage(content=content))
-        elif role == "assistant":
-            result.append(AIMessage(content=content))
-        elif role == "system":
-            result.append(SystemMessage(content=content))
-        elif role == "tool":
-            result.append(ToolMessage(
-                content=content,
-                tool_call_id=msg.get("tool_call_id", "")
-            ))
+        # Otherwise, convert from dict
+        if isinstance(msg, dict):
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+
+            if role == "user":
+                result.append(HumanMessage(content=content))
+            elif role == "assistant":
+                result.append(AIMessage(content=content))
+            elif role == "system":
+                result.append(SystemMessage(content=content))
+            elif role == "tool":
+                result.append(ToolMessage(
+                    content=content,
+                    tool_call_id=msg.get("tool_call_id", "")
+                ))
+            else:
+                result.append(HumanMessage(content=content))
         else:
-            result.append(HumanMessage(content=content))
+            # Fallback for unknown types
+            result.append(HumanMessage(content=str(msg)))
 
     return result
 
@@ -101,40 +150,72 @@ def _convert_from_langchain_messages(messages: List[Any]) -> List[Dict]:
 
 
 async def init_context_node(state: AgentState) -> Dict[str, Any]:
-    """Initialize context node - Reset state fields for new request.
+    """Initialize context node - Reset transient state + inject long-term memory.
 
-    This node prepares the state for a fresh agent invocation.
+    Messages are NOT cleared here — RedisSaver automatically restores
+    the previous conversation history from the checkpointer.
     """
-    return {
+    result = {
         "token_count": 0,
         "pending_tool_calls": [],
         "tool_results": {},
         "should_compress": False,
         "should_end": False,
-        "messages": [],  # Will be populated by load_memory
         # TodoWrite nag reminder state
         "rounds_without_todo": 0,
         "used_todo_last_round": False,
         "has_open_todos": False,
     }
 
+    # === Chroma 长期记忆检索（仅新会话首条消息） ===
+    messages = state.get("messages", [])
+    user_id = state.get("user_id")
 
-async def load_memory_node(state: AgentState) -> Dict[str, Any]:
-    """Load memory from Redis.
+    # 仅当会话只有 1 条消息（全新会话的第一条用户消息）时注入
+    is_new_session = len(messages) == 1
 
-    Retrieves conversation history from short-term memory.
-    """
-    from enterprise_agent.memory.short_term import ShortTermMemory
-    from enterprise_agent.db.redis import redis_client
+    if is_new_session and user_id:
+        last_user_msg = None
+        for msg in reversed(messages):
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                last_user_msg = msg.get("content", "")
+                break
 
-    stm = ShortTermMemory(redis_client)
-    messages = await stm.get_messages(state["session_id"])
+        if last_user_msg:
+            try:
+                from enterprise_agent.memory.long_term import get_long_term_memory
+                memory = get_long_term_memory(user_id)
+                past_conversations = await memory.search_conversations(
+                    query=last_user_msg,
+                    n_results=3,
+                )
 
-    # Apply microcompact to loaded messages to prevent bloat
-    ctx_mgr = get_context_manager()
-    messages = ctx_mgr.microcompact(messages, keep_last=3)
+                if past_conversations:
+                    context_parts = []
+                    for conv in past_conversations:
+                        role = conv.get("metadata", {}).get("role", "unknown")
+                        content = conv.get("content", "")
+                        if len(content) > 500:
+                            content = content[:500] + "..."
+                        context_parts.append(f"[{role}]: {content}")
 
-    return {"messages": messages}
+                    context_text = "\n".join(context_parts)
+                    if len(context_text) > 2000:
+                        context_text = context_text[:2000] + "..."
+
+                    result["messages"] = [{
+                        "role": "system",
+                        "content": (
+                            "<long_term_memory>\n"
+                            "以下是与当前问题相关的历史对话记录，供参考：\n"
+                            f"{context_text}\n"
+                            "</long_term_memory>"
+                        )
+                    }]
+            except Exception:
+                pass  # Chroma 故障不影响主流程
+
+    return result
 
 
 async def pre_llm_microcompact_node(state: AgentState) -> Dict[str, Any]:
@@ -146,8 +227,8 @@ async def pre_llm_microcompact_node(state: AgentState) -> Dict[str, Any]:
     messages = state.get("messages", [])
     ctx_mgr = get_context_manager()
 
-    # Apply microcompact
-    compacted = ctx_mgr.microcompact(messages, keep_last=3)
+    # Apply microcompact (use langchain version to handle message objects)
+    compacted = ctx_mgr.microcompact_langchain(messages, keep_last=settings.MICROCOMPACT_KEEP_LAST)
 
     return {"messages": compacted}
 
@@ -162,7 +243,10 @@ async def llm_call_node(state: AgentState) -> Dict[str, Any]:
     # Convert to LangChain format for invocation
     lc_messages = _convert_to_langchain_messages(messages)
 
-    response = await llm_with_tools.ainvoke(lc_messages)
+    # Inject system prompt as the first message
+    lc_messages.insert(0, SystemMessage(content=MAIN_SYSTEM_PROMPT))
+
+    response = await get_llm_with_tools().ainvoke(lc_messages)
 
     # Extract tool calls if present
     tool_calls = []
@@ -203,7 +287,7 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
     Special handling for compress tool to trigger compression.
     Tracks TodoWrite usage for nag reminder mechanism.
     """
-    from enterprise_agent.core.agent.tools import ALL_TOOLS, get_tool_by_name
+    from enterprise_agent.core.agent.tools import ALL_TOOLS
     from enterprise_agent.core.agent.tools.task import get_todo_manager
 
     results = {}
@@ -236,8 +320,8 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
                 else:
                     # Limit output size
                     result_str = str(result)
-                    if len(result_str) > 50000:
-                        result_str = result_str[:50000] + "\n... (truncated, see transcript)"
+                    if len(result_str) > settings.TOOL_OUTPUT_MAX_CHARS:
+                        result_str = result_str[:settings.TOOL_OUTPUT_MAX_CHARS] + "\n... (truncated, see transcript)"
 
                 results[tool_id] = result_str
             except Exception as e:
@@ -269,40 +353,25 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
 
 
 async def save_memory_node(state: AgentState) -> Dict[str, Any]:
-    """Save memory to Redis.
+    """Save memory node - handles TodoWrite nag reminder logic.
 
-    Persists conversation history to short-term memory.
-    Also handles TodoWrite nag reminder mechanism (s03).
+    Message persistence is handled automatically by RedisSaver checkpointer.
+    This node only manages the nag reminder mechanism (s03):
+    tracks rounds without todo usage and injects reminder messages when needed.
     """
-    from enterprise_agent.memory.short_term import ShortTermMemory
-    from enterprise_agent.db.redis import redis_client
-
-    stm = ShortTermMemory(redis_client)
-
-    # Save latest messages (assistant + tool results)
-    messages = state.get("messages", [])
-    for msg in messages[-4:]:  # Save last few messages
-        role = msg.get("role", "assistant")
-        content = msg.get("content", "")
-        await stm.append_message(state["session_id"], role, content)
-
     # === TodoWrite nag reminder mechanism (s03) ===
-    # Update rounds_without_todo counter
     used_todo = state.get("used_todo_last_round", False)
     rounds_without_todo = state.get("rounds_without_todo", 0)
     rounds_without_todo = 0 if used_todo else rounds_without_todo + 1
 
-    # Check if we need to add nag reminder
     has_open_todos = state.get("has_open_todos", False)
     additional_messages = []
 
-    if has_open_todos and rounds_without_todo >= 3:
-        # Add nag reminder message
+    if has_open_todos and rounds_without_todo >= settings.NAG_REMINDER_THRESHOLD:
         additional_messages.append({
             "role": "user",
             "content": "<reminder>Update your todos. You have open todo items that need status updates.</reminder>"
         })
-        # Reset counter after reminder
         rounds_without_todo = 0
 
     return {
@@ -319,6 +388,7 @@ async def compress_context_node(state: AgentState) -> Dict[str, Any]:
     2. Save transcript to file
     3. Generate summary via LLM
     4. Replace messages with summary
+    5. Store summary to Chroma as long-term memory
     """
     ctx_mgr = get_context_manager()
     token_count = state.get("token_count", 0)
@@ -327,13 +397,29 @@ async def compress_context_node(state: AgentState) -> Dict[str, Any]:
     if token_count > settings.TOKEN_THRESHOLD:
         messages = state.get("messages", [])
         session_id = state.get("session_id", "unknown")
+        user_id = state.get("user_id")
 
         # Perform full compression
         compression_result = await ctx_mgr.auto_compact(messages, session_id)
 
+        # Store compression summary to Chroma as long-term memory
+        summary = compression_result.get("context_summary")
+        if summary and user_id:
+            try:
+                from enterprise_agent.memory.long_term import get_long_term_memory
+                memory = get_long_term_memory(user_id)
+                await memory.store_conversation(
+                    session_id=session_id,
+                    role="system",
+                    content=summary,
+                    metadata={"type": "session_summary"},
+                )
+            except Exception:
+                pass  # Chroma 故障不影响主流程
+
         return {
             "messages": compression_result["compressed_messages"],
-            "context_summary": compression_result["context_summary"],
+            "context_summary": summary,
             "transcript_path": compression_result["transcript_path"],
             "token_count": compression_result["token_count_reset"],
             "should_compress": False
@@ -350,13 +436,29 @@ async def manual_compress_node(state: AgentState) -> Dict[str, Any]:
     ctx_mgr = get_context_manager()
     messages = state.get("messages", [])
     session_id = state.get("session_id", "unknown")
+    user_id = state.get("user_id")
 
     # Always compress when manually triggered
     compression_result = await ctx_mgr.manual_compress(messages, session_id)
 
+    # Store compression summary to Chroma as long-term memory
+    summary = compression_result.get("context_summary")
+    if summary and user_id:
+        try:
+            from enterprise_agent.memory.long_term import get_long_term_memory
+            memory = get_long_term_memory(user_id)
+            await memory.store_conversation(
+                session_id=session_id,
+                role="system",
+                content=summary,
+                metadata={"type": "session_summary"},
+            )
+        except Exception:
+            pass  # Chroma 故障不影响主流程
+
     return {
         "messages": compression_result["compressed_messages"],
-        "context_summary": compression_result["context_summary"],
+        "context_summary": summary,
         "transcript_path": compression_result["transcript_path"],
         "token_count": compression_result["token_count_reset"],
         "should_compress": False,
@@ -441,7 +543,7 @@ async def check_inbox_node(state: AgentState) -> Dict[str, Any]:
     from enterprise_agent.core.agent.tools.team import get_message_bus
 
     bus = get_message_bus()
-    messages = bus.read_inbox("lead")
+    messages = await bus.read_inbox("lead")
 
     if messages:
         inbox_text = json.dumps(messages, indent=2)

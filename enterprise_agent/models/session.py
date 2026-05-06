@@ -1,7 +1,8 @@
-from sqlalchemy import Column, String, BigInteger, JSON, TIMESTAMP, Enum, ForeignKey
-from sqlalchemy.orm import relationship
-from datetime import datetime
 import enum
+from datetime import datetime, timezone
+
+from sqlalchemy import JSON, TIMESTAMP, BigInteger, Column, Enum, ForeignKey, String
+from sqlalchemy.orm import relationship
 
 from enterprise_agent.db.mysql import Base
 
@@ -18,13 +19,16 @@ class Session(Base):
     __tablename__ = "sessions"
 
     id = Column(String(36), primary_key=True)  # UUID
-    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(BigInteger, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     title = Column(String(255), nullable=True)
     status = Column(Enum(SessionStatus), default=SessionStatus.ACTIVE)
-    metadata = Column(JSON, default={})
-    created_at = Column(TIMESTAMP, default=datetime.utcnow)
-    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+    session_metadata = Column("metadata", JSON, default=dict)
+    created_at = Column(TIMESTAMP, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        TIMESTAMP,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
 
     # Relationships
     user = relationship("User", back_populates="sessions")
-    messages = relationship("ConversationMessage", back_populates="session", cascade="all, delete-orphan")

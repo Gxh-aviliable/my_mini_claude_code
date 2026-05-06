@@ -1,5 +1,7 @@
 import asyncio
 
+# Import all models so they register with Base.metadata before create_all()
+import enterprise_agent.models  # noqa: F401
 from enterprise_agent.db.mysql import init_db
 
 

@@ -1,3 +1,4 @@
+import logging
 from enum import Enum
 from typing import List
 
@@ -49,6 +50,8 @@ def get_role_permissions(role: str) -> List[Permission]:
     Returns:
         List of Permission enums
     """
+    if role not in ROLE_PERMISSIONS:
+        logging.warning(f"Unknown role '{role}', falling back to 'free'")
     return ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["free"])
 
 

@@ -9,11 +9,13 @@ Includes:
 - claim_task: Claim a task by ID
 """
 
-from langchain_core.tools import tool
-from typing import List, Dict, Optional
-from pathlib import Path
 import json
-import os
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from langchain_core.tools import tool
+
+from enterprise_agent.config.settings import settings
 
 # Task storage directory - relative to workspace
 TASKS_DIR_NAME = ".tasks"
@@ -152,7 +154,7 @@ class TodoManager:
     """Short-lived checklist tracking (TodoWrite).
 
     Different from TaskManager - todos are ephemeral in-session checklists.
-    Max 20 items, only one in_progress at a time.
+    Max items and in_progress limits configured in settings.
     """
 
     def __init__(self):
@@ -186,10 +188,10 @@ class TodoManager:
             })
 
         # Constraints
-        if len(validated) > 20:
-            raise ValueError("Maximum 20 todos allowed")
-        if in_progress_count > 1:
-            raise ValueError("Only one in_progress item allowed at a time")
+        if len(validated) > settings.TODO_MAX_ITEMS:
+            raise ValueError(f"Maximum {settings.TODO_MAX_ITEMS} todos allowed")
+        if in_progress_count > settings.TODO_MAX_IN_PROGRESS:
+            raise ValueError(f"Only {settings.TODO_MAX_IN_PROGRESS} in_progress item(s) allowed at a time")
 
         self.items = validated
         return self.render()
@@ -227,6 +229,7 @@ _todo_manager: Optional[TodoManager] = None
 
 def get_task_manager() -> TaskManager:
     """Get or create TaskManager instance."""
+    global _task_manager
     if _task_manager is None:
         _task_manager = TaskManager()
     return _task_manager
@@ -234,6 +237,7 @@ def get_task_manager() -> TaskManager:
 
 def get_todo_manager() -> TodoManager:
     """Get or create TodoManager instance."""
+    global _todo_manager
     if _todo_manager is None:
         _todo_manager = TodoManager()
     return _todo_manager

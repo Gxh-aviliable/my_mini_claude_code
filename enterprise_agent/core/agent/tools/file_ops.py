@@ -1,21 +1,9 @@
-from langchain_core.tools import tool
-from pathlib import Path
 from typing import Optional
 
-WORKDIR = Path.cwd()
+from langchain_core.tools import tool
 
-
-class SafePathValidator:
-    """Validate paths to prevent workspace escape"""
-
-    def __init__(self, path: str):
-        self.path = path
-
-    def validate_path(self, workdir: Path) -> Path:
-        resolved = (workdir / self.path).resolve()
-        if not resolved.is_relative_to(workdir):
-            raise ValueError(f"Path escapes workspace: {self.path}")
-        return resolved
+from enterprise_agent.config.settings import settings
+from enterprise_agent.core.agent.tools.workspace import get_user_workspace, resolve_path
 
 
 @tool
@@ -29,13 +17,12 @@ def read_file(path: str, limit: Optional[int] = None) -> str:
     Returns:
         File contents as string
     """
-    validator = SafePathValidator(path)
     try:
-        fp = validator.validate_path(WORKDIR)
+        fp = resolve_path(path)
         lines = fp.read_text(encoding="utf-8").splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)[:50000]
+        return "\n".join(lines)[:settings.TOOL_OUTPUT_MAX_CHARS]
     except Exception as e:
         return f"Error: {e}"
 
@@ -51,9 +38,8 @@ def write_file(path: str, content: str) -> str:
     Returns:
         Success message with bytes written
     """
-    validator = SafePathValidator(path)
     try:
-        fp = validator.validate_path(WORKDIR)
+        fp = resolve_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content, encoding="utf-8")
         return f"Wrote {len(content)} bytes to {path}"
@@ -73,9 +59,8 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
     Returns:
         Success message or error
     """
-    validator = SafePathValidator(path)
     try:
-        fp = validator.validate_path(WORKDIR)
+        fp = resolve_path(path)
         content = fp.read_text(encoding="utf-8")
         if old_text not in content:
             return f"Error: Text not found in {path}"

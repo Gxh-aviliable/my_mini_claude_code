@@ -1,14 +1,17 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+import logging
 from contextlib import asynccontextmanager
 
-from enterprise_agent.config.settings import settings
-from enterprise_agent.db.mysql import close_db
-from enterprise_agent.db.redis import close_redis
-from enterprise_agent.db.chroma import init_chroma
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
 from enterprise_agent.api.routes.auth import router as auth_router
 from enterprise_agent.api.routes.chat import router as chat_router
 from enterprise_agent.api.routes.chat import sessions_router
+from enterprise_agent.config.settings import settings
+from enterprise_agent.db.chroma import init_chroma
+from enterprise_agent.db.mysql import close_db
+from enterprise_agent.db.redis import close_redis
 
 
 @asynccontextmanager
@@ -17,6 +20,9 @@ async def lifespan(app: FastAPI):
     # Startup
     # Initialize Chroma vector database
     init_chroma()
+    # Initialize RedisSaver checkpointer (sets up Redis indexes)
+    from enterprise_agent.core.agent.graph import setup_checkpointer
+    await setup_checkpointer()
     yield
     # Shutdown
     await close_db()
@@ -31,9 +37,10 @@ app = FastAPI(
 )
 
 # CORS middleware
+origins = [o.strip() for o in settings.CORS_ORIGINS.split(",")]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure for production
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -43,6 +50,13 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(sessions_router)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Catch-all exception handler to prevent stack trace leaks."""
+    logging.exception("Unhandled exception: %s", exc)
+    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
 
 @app.get("/health")

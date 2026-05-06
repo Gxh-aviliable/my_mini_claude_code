@@ -1,5 +1,7 @@
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+import uuid
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, Optional
+
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
@@ -14,6 +16,7 @@ class TokenPayload(BaseModel):
     iat: datetime
     type: str  # 'access' or 'refresh'
     permissions: Optional[list] = None
+    jti: Optional[str] = None  # JWT ID for token rotation
 
 
 class JWTHandler:
@@ -34,7 +37,7 @@ class JWTHandler:
         Returns:
             Dict with access_token, refresh_token, token_type, expires_in
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         access_payload = {
             "sub": user_id,
@@ -48,7 +51,8 @@ class JWTHandler:
             "sub": user_id,
             "iat": now,
             "exp": now + timedelta(days=settings.REFRESH_TOKEN_EXPIRE_DAYS),
-            "type": "refresh"
+            "type": "refresh",
+            "jti": str(uuid.uuid4()),
         }
 
         return {
@@ -69,12 +73,22 @@ class JWTHandler:
             TokenPayload if valid, None otherwise
         """
         try:
-            payload = jwt.decode(token, self.secret_key, algorithms=[self.algorithm])
+            payload = jwt.decode(
+                token, self.secret_key, algorithms=[self.algorithm],
+                options={"verify_sub": False}
+            )
             if payload.get("type") != token_type:
                 return None
             payload["exp"] = datetime.fromtimestamp(payload["exp"])
             payload["iat"] = datetime.fromtimestamp(payload["iat"])
             return TokenPayload(**payload)
+        except JWTError:
+            return None
+
+    def decode_token_unverified(self, token: str) -> Optional[Dict[str, Any]]:
+        """Decode token without verification (for extracting jti)."""
+        try:
+            return jwt.get_unverified_claims(token)
         except JWTError:
             return None
 

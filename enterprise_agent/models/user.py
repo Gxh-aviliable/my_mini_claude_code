@@ -1,6 +1,7 @@
-from sqlalchemy import Column, BigInteger, String, Boolean, TIMESTAMP, Index, Text
+from datetime import datetime, timezone
+
+from sqlalchemy import TIMESTAMP, BigInteger, Boolean, Column, String
 from sqlalchemy.orm import relationship
-from datetime import datetime
 
 from enterprise_agent.db.mysql import Base
 
@@ -16,12 +17,14 @@ class User(Base):
     full_name = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True)
     is_superuser = Column(Boolean, default=False)
-    created_at = Column(TIMESTAMP, default=datetime.utcnow)
-    updated_at = Column(TIMESTAMP, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(TIMESTAMP, default=lambda: datetime.now(timezone.utc))
+    updated_at = Column(
+        TIMESTAMP,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
     last_login_at = Column(TIMESTAMP, nullable=True)
 
     # Relationships
     sessions = relationship("Session", back_populates="user", cascade="all, delete-orphan")
-    preferences = relationship("UserPreference", back_populates="user", cascade="all, delete-orphan")
-    patterns = relationship("UserPattern", back_populates="user", cascade="all, delete-orphan")
     api_keys = relationship("APIKey", back_populates="user", cascade="all, delete-orphan")

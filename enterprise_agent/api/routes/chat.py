@@ -1,18 +1,18 @@
+import json
+import uuid
+from datetime import datetime, timezone
+
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from datetime import datetime
-import uuid
-import json
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from enterprise_agent.api.middleware.auth import get_current_user
 from enterprise_agent.api.schemas.chat import ChatRequest, ChatResponse, SessionCreate, SessionResponse
+from enterprise_agent.core.agent.graph import get_agent_graph
+from enterprise_agent.core.agent.tools.workspace import set_current_user_id
 from enterprise_agent.db.mysql import get_db
-from enterprise_agent.db.redis import redis_client
-from enterprise_agent.memory.short_term import ShortTermMemory
 from enterprise_agent.models.session import Session, SessionStatus
-from enterprise_agent.core.agent.graph import agent_graph
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -33,28 +33,71 @@ async def chat_completion(
     """
     session_id = request.session_id or str(uuid.uuid4())
 
-    stm = ShortTermMemory(redis_client)
+    # Set user context for workspace isolation
+    set_current_user_id(user_id)
 
-    # Add user message to Redis
-    await stm.append_message(session_id, "user", request.content)
+    # Execute agent graph with thread_id for state persistence
+    result = await get_agent_graph().ainvoke(
+        {
+            "session_id": session_id,
+            "user_id": user_id,
+            "messages": [{"role": "user", "content": request.content}]
+        },
+        config={"configurable": {"thread_id": session_id}}
+    )
 
-    # Execute agent graph
-    result = await agent_graph.ainvoke({
-        "session_id": session_id,
-        "user_id": user_id,
-        "messages": [{"role": "user", "content": request.content}]
-    })
+    # Get last message (guard against empty messages)
+    messages = result.get("messages", [])
+    if not messages:
+        raise HTTPException(status_code=500, detail="Agent returned no response")
+    last_msg = messages[-1]
 
-    # Get last message
-    last_msg = result.get("messages", [])[-1]
-    content = last_msg.content if hasattr(last_msg, "content") else str(last_msg)
+    # Extract content - handle both string and content block formats
+    if hasattr(last_msg, "content"):
+        raw_content = last_msg.content
+
+        # Debug logging
+        import logging
+        logging.debug(f"Content type: {type(raw_content)}, content: {raw_content}")
+
+        # If content is a list of blocks (Anthropic format), extract text
+        if isinstance(raw_content, list):
+            text_parts = []
+            for block in raw_content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        text_parts.append(block.get("text", ""))
+                elif hasattr(block, "text"):
+                    text_parts.append(block.text)
+            content = "\n".join(text_parts) if text_parts else str(raw_content)
+        elif isinstance(raw_content, str):
+            # Try to parse if it looks like a list representation
+            if raw_content.startswith("[") and raw_content.endswith("]"):
+                try:
+                    import ast
+                    parsed = ast.literal_eval(raw_content)
+                    if isinstance(parsed, list):
+                        text_parts = []
+                        for block in parsed:
+                            if isinstance(block, dict) and block.get("type") == "text":
+                                text_parts.append(block.get("text", ""))
+                        content = "\n".join(text_parts) if text_parts else raw_content
+                    else:
+                        content = raw_content
+                except:
+                    content = raw_content
+            else:
+                content = raw_content
+        else:
+            content = str(raw_content)
+    else:
+        content = str(last_msg)
 
     return ChatResponse(
         session_id=session_id,
-        message_id=0,
         role="assistant",
         content=content,
-        created_at=datetime.utcnow()
+        created_at=datetime.now(timezone.utc)
     )
 
 
@@ -74,17 +117,18 @@ async def chat_stream(
     """
     session_id = request.session_id or str(uuid.uuid4())
 
-    async def generate():
-        stm = ShortTermMemory(redis_client)
-        await stm.append_message(session_id, "user", request.content)
+    # Set user context for workspace isolation
+    set_current_user_id(user_id)
 
-        # Stream agent execution
-        async for event in agent_graph.astream_events(
+    async def generate():
+        # Stream agent execution with thread_id for state persistence
+        async for event in get_agent_graph().astream_events(
             {
                 "session_id": session_id,
                 "user_id": user_id,
                 "messages": [{"role": "user", "content": request.content}]
             },
+            config={"configurable": {"thread_id": session_id}},
             version="v1"
         ):
             if event.get("event") == "on_chain_stream":
@@ -130,8 +174,7 @@ async def list_sessions(
             user_id=s.user_id,
             title=s.title,
             status=s.status.value,
-            created_at=s.created_at,
-            message_count=0
+            created_at=s.created_at
         )
         for s in sessions
     ]
@@ -169,7 +212,6 @@ async def create_session(
         title=session.title,
         status=session.status.value,
         created_at=session.created_at,
-        message_count=0
     )
 
 

@@ -2,11 +2,11 @@
 
 Builds the StateGraph that orchestrates the agent's behavior:
 
-    init_context -> pre_microcompact -> load_memory -> llm_call -> route_after_llm
-                                                                         |
-                         +-----------------------------------------------+
-                         |                    |                          |
-                    tool_executor         compress_context           END
+    init_context -> check_background -> check_inbox -> pre_microcompact -> llm_call -> route_after_llm
+                                                                                             |
+                         +-------------------------------------------------------------------+
+                         |                    |                                              |
+                    tool_executor         compress_context                               END
                          |                    |
                     save_memory          llm_call
                          |
@@ -15,26 +15,40 @@ Builds the StateGraph that orchestrates the agent's behavior:
                +---------+---------+
                |                   |
           compress_context      llm_call
+
+State persistence is handled by RedisSaver (checkpointer), which automatically
+saves/restores the full AgentState (including messages) keyed by thread_id.
 """
 
-from langgraph.graph import StateGraph, END
-from langgraph.checkpoint.memory import MemorySaver
+import redis.asyncio as redis_async
+from langgraph.checkpoint.redis.aio import AsyncRedisSaver
+from langgraph.graph import END, StateGraph
 
-from enterprise_agent.core.agent.state import AgentState
+from enterprise_agent.config.settings import settings
 from enterprise_agent.core.agent.nodes import (
-    init_context_node,
-    load_memory_node,
-    pre_llm_microcompact_node,
-    llm_call_node,
-    tool_executor_node,
-    save_memory_node,
-    compress_context_node,
-    manual_compress_node,
     check_background_node,
     check_inbox_node,
+    compress_context_node,
+    init_context_node,
+    llm_call_node,
+    manual_compress_node,
+    pre_llm_microcompact_node,
     route_after_llm,
-    route_after_tool
+    route_after_tool,
+    save_memory_node,
+    tool_executor_node,
 )
+from enterprise_agent.core.agent.state import AgentState
+
+# Dedicated Redis client for checkpointer (no decode_responses — binary protocol required)
+_checkpointer_pool = redis_async.ConnectionPool(
+    host=settings.REDIS_HOST,
+    port=settings.REDIS_PORT,
+    password=settings.REDIS_PASSWORD,
+    max_connections=10,
+    decode_responses=False,
+)
+_checkpointer_client = redis_async.Redis(connection_pool=_checkpointer_pool)
 
 
 def build_agent_graph():
@@ -48,8 +62,11 @@ def build_agent_graph():
     - Background task notification injection
     - Inbox message checking
 
+    State persistence is handled by RedisSaver checkpointer.
+    Pass config={"configurable": {"thread_id": session_id}} when invoking.
+
     Returns:
-        Compiled StateGraph with MemorySaver checkpointer
+        Compiled StateGraph with AsyncRedisSaver checkpointer
     """
     graph = StateGraph(AgentState)
 
@@ -57,7 +74,6 @@ def build_agent_graph():
 
     # Entry and initialization
     graph.add_node("init_context", init_context_node)
-    graph.add_node("load_memory", load_memory_node)
 
     # Pre-LLM microcompact (key mechanism from original)
     graph.add_node("pre_microcompact", pre_llm_microcompact_node)
@@ -79,12 +95,11 @@ def build_agent_graph():
 
     # === Define Edges ===
 
-    # Entry flow
+    # Entry flow (no load_memory — RedisSaver restores state automatically)
     graph.set_entry_point("init_context")
-    graph.add_edge("init_context", "load_memory")
+    graph.add_edge("init_context", "check_background")
 
     # Pre-processing before LLM
-    graph.add_edge("load_memory", "check_background")  # Inject background results
     graph.add_edge("check_background", "check_inbox")   # Inject inbox messages
     graph.add_edge("check_inbox", "pre_microcompact")   # Apply microcompact
     graph.add_edge("pre_microcompact", "llm_call")      # Then call LLM
@@ -119,8 +134,8 @@ def build_agent_graph():
     # Manual compress ends the invocation
     graph.add_edge("manual_compress", END)
 
-    # Compile with checkpointer for persistence
-    checkpointer = MemorySaver()
+    # Compile with RedisSaver for persistent state management
+    checkpointer = AsyncRedisSaver(redis_client=_checkpointer_client)
     return graph.compile(checkpointer=checkpointer)
 
 
@@ -129,29 +144,27 @@ def build_simple_agent_graph():
 
     This is a simpler version for basic usage:
 
-    init_context -> load_memory -> llm_call -> route
-                                         -> tool_executor -> save -> llm_call
-                                         -> compress -> llm_call
-                                         -> END
+    init_context -> pre_microcompact -> llm_call -> route
+                                                -> tool_executor -> save -> llm_call
+                                                -> compress -> llm_call
+                                                -> END
 
     Returns:
-        Compiled StateGraph
+        Compiled StateGraph with AsyncRedisSaver checkpointer
     """
     graph = StateGraph(AgentState)
 
     # Add nodes
     graph.add_node("init_context", init_context_node)
-    graph.add_node("load_memory", load_memory_node)
     graph.add_node("pre_microcompact", pre_llm_microcompact_node)
     graph.add_node("llm_call", llm_call_node)
     graph.add_node("tool_executor", tool_executor_node)
     graph.add_node("save_memory", save_memory_node)
     graph.add_node("compress_context", compress_context_node)
 
-    # Entry flow
+    # Entry flow (no load_memory — RedisSaver restores state automatically)
     graph.set_entry_point("init_context")
-    graph.add_edge("init_context", "load_memory")
-    graph.add_edge("load_memory", "pre_microcompact")
+    graph.add_edge("init_context", "pre_microcompact")
     graph.add_edge("pre_microcompact", "llm_call")
 
     # Conditional routing after LLM
@@ -181,12 +194,39 @@ def build_simple_agent_graph():
     # Compress back to LLM
     graph.add_edge("compress_context", "llm_call")
 
-    checkpointer = MemorySaver()
+    checkpointer = AsyncRedisSaver(redis_client=_checkpointer_client)
     return graph.compile(checkpointer=checkpointer)
 
 
-# Global graph instance (use full version by default)
-agent_graph = build_agent_graph()
+# Lazy graph initialization (avoids crash at import time)
+_agent_graph = None
+_simple_agent_graph = None
 
-# Alternative simple graph
-simple_agent_graph = build_simple_agent_graph()
+
+def get_agent_graph():
+    """Get or create the full agent graph (lazy initialization)."""
+    global _agent_graph
+    if _agent_graph is None:
+        _agent_graph = build_agent_graph()
+    return _agent_graph
+
+
+def get_simple_agent_graph():
+    """Get or create the simple agent graph (lazy initialization)."""
+    global _simple_agent_graph
+    if _simple_agent_graph is None:
+        _simple_agent_graph = build_simple_agent_graph()
+    return _simple_agent_graph
+
+
+async def setup_checkpointer():
+    """Initialize the RedisSaver checkpointer (call once at app startup).
+
+    AsyncRedisSaver requires asetup() to be called before first use
+    to set up Redis indexes for checkpoint storage.
+    """
+    graph = get_agent_graph()
+    # Access the checkpointer from the compiled graph and run setup
+    checkpointer = graph.checkpointer
+    if hasattr(checkpointer, "asetup"):
+        await checkpointer.asetup()

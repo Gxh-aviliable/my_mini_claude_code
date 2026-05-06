@@ -7,16 +7,8 @@ Provides:
 """
 
 from langchain_core.tools import tool
-from typing import Optional, List
-from pathlib import Path
-import json
 
-from enterprise_agent.core.agent.context import (
-    get_context_manager,
-    get_transcript_manager,
-    TranscriptManager
-)
-
+from enterprise_agent.core.agent.context import get_context_manager, get_transcript_manager
 
 # === Tool Definitions ===
 

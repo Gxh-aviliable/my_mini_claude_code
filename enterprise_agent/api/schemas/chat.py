@@ -1,6 +1,7 @@
-from pydantic import BaseModel, Field
-from typing import Optional, Dict, Any, List
 from datetime import datetime
+from typing import Any, Dict, List, Optional
+
+from pydantic import BaseModel, Field
 
 
 class ChatRequest(BaseModel):
@@ -13,7 +14,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     """Chat response"""
     session_id: str
-    message_id: int
+    message_id: Optional[int] = None
     role: str
     content: str
     tool_calls: Optional[List[Dict[str, Any]]] = None
@@ -32,4 +33,4 @@ class SessionResponse(BaseModel):
     title: Optional[str]
     status: str
     created_at: datetime
-    message_count: int = 0
+    message_count: Optional[int] = 0

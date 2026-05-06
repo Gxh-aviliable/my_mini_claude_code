@@ -13,64 +13,60 @@ Tools are organized by module:
 - context_tools: compress, list_transcripts, get_transcript, context_status
 """
 
-from langchain_core.tools import Tool
-
 # File operations
-from enterprise_agent.core.agent.tools.file_ops import (
-    read_file,
-    write_file,
-    edit_file,
-)
-
-# Shell execution
-from enterprise_agent.core.agent.tools.shell import bash
-
-# Task management
-from enterprise_agent.core.agent.tools.task import (
-    todo_update,
-    task_create,
-    task_get,
-    task_update,
-    task_list,
-    claim_task,
-)
-
-# Subagent delegation
-from enterprise_agent.core.agent.tools.subagent import task as subagent_task
-
 # Background tasks
 from enterprise_agent.core.agent.tools.background import (
     background_run,
     check_background,
 )
 
+# Context management
+from enterprise_agent.core.agent.tools.context_tools import (
+    compress,
+    context_status,
+    get_transcript,
+    list_transcripts,
+)
+from enterprise_agent.core.agent.tools.file_ops import (
+    edit_file,
+    read_file,
+    write_file,
+)
+
+# Shell execution
+from enterprise_agent.core.agent.tools.shell import bash
+
 # Skills
 from enterprise_agent.core.agent.tools.skills import (
-    load_skill,
     list_skills,
+    load_skill,
     reload_skills,
+)
+
+# Subagent delegation
+from enterprise_agent.core.agent.tools.subagent import task as subagent_task
+
+# Task management
+from enterprise_agent.core.agent.tools.task import (
+    claim_task,
+    task_create,
+    task_get,
+    task_list,
+    task_update,
+    todo_update,
 )
 
 # Team collaboration
 from enterprise_agent.core.agent.tools.team import (
-    spawn_teammate,
-    list_teammates,
-    send_message,
-    read_inbox,
     broadcast,
-    shutdown_request,
-    plan_approval,
     idle,
+    list_teammates,
+    plan_approval,
+    read_inbox,
+    send_message,
+    shutdown_request,
+    spawn_teammate,
 )
-
-# Context management
-from enterprise_agent.core.agent.tools.context_tools import (
-    compress,
-    list_transcripts,
-    get_transcript,
-    context_status,
-)
-
 
 # === Tool Registry ===
 
@@ -139,7 +135,10 @@ def get_tools_for_permissions(user_permissions: list) -> list:
         "tools:subagent": [subagent_task],
         "tools:background": [background_run, check_background],
         "tools:skills": [load_skill, list_skills, reload_skills],
-        "tools:team": [spawn_teammate, list_teammates, send_message, read_inbox, broadcast, shutdown_request, plan_approval, idle],
+        "tools:team": [
+            spawn_teammate, list_teammates, send_message, read_inbox,
+            broadcast, shutdown_request, plan_approval, idle,
+        ],
         "tools:context": [compress, list_transcripts, get_transcript, context_status],
         "tools:all": ALL_TOOLS,
     }

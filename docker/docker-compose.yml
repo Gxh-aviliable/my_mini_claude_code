@@ -27,7 +27,7 @@ services:
       - MYSQL_USER=agent_user
       - MYSQL_PASSWORD=agent_password
     ports:
-      - "3306:3306"
+      - "3307:3306"
     volumes:
       - mysql_data:/var/lib/mysql
     healthcheck:
@@ -38,12 +38,12 @@ services:
     restart: unless-stopped
 
   redis:
-    image: redis:7-alpine
+    image: redis/redis-stack-server:latest
     ports:
       - "6379:6379"
     volumes:
       - redis_data:/data
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --protected-mode no --loadmodule /opt/redis-stack/lib/redisearch.so --loadmodule /opt/redis-stack/lib/rejson.so --loadmodule /opt/redis-stack/lib/redisbloom.so --loadmodule /opt/redis-stack/lib/redistimeseries.so
     restart: unless-stopped
 
 volumes:

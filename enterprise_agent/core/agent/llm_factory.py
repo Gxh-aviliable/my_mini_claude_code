@@ -4,7 +4,6 @@ Provides a unified interface for creating LLM instances based on provider config
 Supported providers: Anthropic, GLM, DeepSeek, OpenAI (and OpenAI-compatible APIs).
 """
 
-from typing import Optional
 from langchain_core.language_models import BaseChatModel
 
 from enterprise_agent.config.settings import settings

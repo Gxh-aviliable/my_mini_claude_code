@@ -20,17 +20,17 @@ Architecture:
     Timeout or shutdown_request -> terminate
 """
 
-from langchain_core.tools import tool, StructuredTool
-from typing import Optional, List, Dict, Any, Callable
-from pathlib import Path
+import asyncio
 import json
 import time
-import asyncio
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional
+
+from langchain_core.tools import tool
 
 from enterprise_agent.config.settings import settings
-
 
 # Directory paths for team coordination
 TEAM_DIR_NAME = ".team"
@@ -49,6 +49,32 @@ VALID_MSG_TYPES = {
 IDLE_TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 5
 MAX_WORK_ROUNDS = 50
+
+# System prompt template for team agents
+TEAMMATE_SYSTEM_PROMPT_TEMPLATE = """You are '{name}', a teammate agent with role: {role}.
+
+## Identity
+- Your name: {name}
+- Your role: {role}
+- You are part of a multi-agent team coordinated by the lead agent
+
+## Capabilities
+- Execute tasks using available tools (bash, file operations, etc.)
+- Communicate with teammates via message passing
+- Auto-claim unclaimed tasks during idle phase
+
+## Team Collaboration
+- **Inbox**: Check your inbox for messages from teammates or the lead
+- **Send messages**: Use `send_message` tool to communicate with specific teammates
+- **Idle**: Call `idle` tool when you finish your current work to enter idle phase
+- **Task claiming**: During idle phase, you will auto-claim unclaimed tasks
+
+## Guidelines
+1. Complete your assigned work thoroughly
+2. Report progress and results back to the lead agent
+3. When done with a task, call `idle` to signal availability
+4. Be concise in communications
+5. If you encounter blockers, message the lead agent for guidance"""
 
 
 class AsyncMessageBus:
@@ -98,7 +124,7 @@ class AsyncMessageBus:
             "from": sender,
             "content": content,
             "timestamp": time.time(),
-            "datetime": datetime.utcnow().isoformat()
+            "datetime": datetime.now(timezone.utc).isoformat()
         }
         if extra:
             msg.update(extra)
@@ -271,8 +297,14 @@ class TeammateRunner:
         else:
             await self.config.add_member(self.name, self.role, "working")
 
-        # Initialize messages
-        self.messages = [{"role": "user", "content": prompt}]
+        # Initialize messages with system prompt
+        system_prompt = TEAMMATE_SYSTEM_PROMPT_TEMPLATE.format(
+            name=self.name, role=self.role
+        )
+        self.messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": prompt},
+        ]
 
         # Start asyncio task
         self.task = asyncio.create_task(self._run_loop())
@@ -323,9 +355,9 @@ class TeammateRunner:
 
     async def _work_phase(self) -> None:
         """Work phase: process messages and use tools."""
-        from enterprise_agent.core.agent.tools import ALL_TOOLS
         from enterprise_agent.core.agent.context import get_context_manager
         from enterprise_agent.core.agent.llm_factory import get_llm
+        from enterprise_agent.core.agent.tools import ALL_TOOLS
 
         llm = get_llm()
         llm_with_tools = llm.bind_tools(ALL_TOOLS)
@@ -358,7 +390,7 @@ class TeammateRunner:
                 })
 
             # Apply microcompact
-            self.messages = ctx_mgr.microcompact(self.messages, keep_last=3)
+            self.messages = ctx_mgr.microcompact(self.messages, keep_last=settings.MICROCOMPACT_KEEP_LAST)
 
             # Call LLM
             try:
@@ -410,7 +442,7 @@ class TeammateRunner:
                         result = await self._execute_tool(tool_name, tool_input)
                         tool_results.append({
                             "role": "tool",
-                            "content": str(result)[:50000],
+                            "content": str(result)[:settings.TOOL_OUTPUT_MAX_CHARS],
                             "tool_call_id": tool_id
                         })
 
@@ -462,12 +494,15 @@ class TeammateRunner:
                 await self._claim_task(task["id"])
 
                 # Inject identity and auto-claimed message
-                if len(self.messages) <= 3:
+                if len(self.messages) <= settings.MICROCOMPACT_KEEP_LAST:
                     identity_msg = f"<identity>You are '{self.name}', role: {self.role}.</identity>"
                     self.messages.insert(0, {"role": "user", "content": identity_msg})
                     self.messages.insert(1, {"role": "assistant", "content": f"I am {self.name}. Continuing."})
 
-                claimed_msg = f"<auto-claimed>Task #{task['id']}: {task['subject']}\n{task.get('description', '')}</auto-claimed>"
+                desc = task.get('description', '')
+                claimed_msg = (
+                    f"<auto-claimed>Task #{task['id']}: {task['subject']}\n{desc}</auto-claimed>"
+                )
                 self.messages.append({"role": "user", "content": claimed_msg})
                 self.messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
 
@@ -485,8 +520,6 @@ class TeammateRunner:
     async def _find_unclaimed_tasks(self) -> List[dict]:
         """Find unclaimed tasks that are not blocked."""
         from enterprise_agent.core.agent.tools.task import get_task_manager
-        from pathlib import Path
-        import json
 
         tm = get_task_manager()
         tasks_dir = tm.tasks_dir
@@ -664,6 +697,7 @@ _plan_manager: Optional[PlanApprovalManager] = None
 
 def get_message_bus() -> AsyncMessageBus:
     """Get or create AsyncMessageBus instance."""
+    global _message_bus
     if _message_bus is None:
         _message_bus = AsyncMessageBus()
     return _message_bus
@@ -671,6 +705,7 @@ def get_message_bus() -> AsyncMessageBus:
 
 def get_teammate_manager() -> TeammateManager:
     """Get or create TeammateManager instance."""
+    global _teammate_manager
     if _teammate_manager is None:
         _teammate_manager = TeammateManager()
     return _teammate_manager
@@ -678,177 +713,115 @@ def get_teammate_manager() -> TeammateManager:
 
 def get_plan_manager() -> PlanApprovalManager:
     """Get or create PlanApprovalManager instance."""
+    global _plan_manager
     if _plan_manager is None:
         _plan_manager = PlanApprovalManager(get_message_bus())
     return _plan_manager
 
 
 # === Tool Definitions ===
-# Using async functions wrapped for LangChain tool compatibility
-
-from langchain_core.tools import StructuredTool
+# All tools are async to avoid event loop conflicts in LangGraph
 
 
-def _run_async(coro):
-    """Run async coroutine, handling existing loop context.
+@tool
+async def spawn_teammate(name: str, role: str, prompt: str) -> str:
+    """Spawn a persistent autonomous teammate that works independently.
 
-    If already in async context, returns coroutine for later execution.
-    Otherwise, runs in new loop.
+    Args:
+        name: Unique name for the teammate
+        role: Role description for the teammate
+        prompt: Initial work prompt
+
+    Returns:
+        Spawn confirmation
     """
-    try:
-        loop = asyncio.get_running_loop()
-        # Already in async context - return coroutine
-        # The tool_executor_node will handle async execution
-        return coro
-    except RuntimeError:
-        # No running loop - run now
-        return asyncio.run(coro)
-
-
-def _spawn_teammate_sync(name: str, role: str, prompt: str) -> str:
-    """Sync wrapper for spawn_teammate."""
-    tm = get_teammate_manager()
-    return asyncio.run(tm.spawn(name, role, prompt))
-
-
-async def _spawn_teammate_async(name: str, role: str, prompt: str) -> str:
-    """Async implementation of spawn_teammate."""
     tm = get_teammate_manager()
     return await tm.spawn(name, role, prompt)
 
 
-spawn_teammate = StructuredTool.from_function(
-    func=_spawn_teammate_sync,
-    coroutine=_spawn_teammate_async,
-    name="spawn_teammate",
-    description="Spawn a persistent autonomous teammate that works independently.",
-)
+@tool
+async def list_teammates() -> str:
+    """List all teammates and their status.
 
-
-def _list_teammates_sync() -> str:
-    """Sync wrapper for list_teammates."""
-    tm = get_teammate_manager()
-    return asyncio.run(tm.list_all())
-
-
-async def _list_teammates_async() -> str:
-    """Async implementation of list_teammates."""
+    Returns:
+        Formatted list of teammates
+    """
     tm = get_teammate_manager()
     return await tm.list_all()
 
 
-list_teammates = StructuredTool.from_function(
-    func=_list_teammates_sync,
-    coroutine=_list_teammates_async,
-    name="list_teammates",
-    description="List all teammates and their status.",
-)
+@tool
+async def send_message(to: str, content: str, msg_type: str = "message") -> str:
+    """Send a message to a teammate.
 
+    Args:
+        to: Recipient name
+        content: Message content
+        msg_type: Message type (message, broadcast, shutdown_request, etc.)
 
-def _send_message_sync(to: str, content: str, msg_type: str = "message") -> str:
-    """Sync wrapper for send_message."""
-    bus = get_message_bus()
-    return asyncio.run(bus.send("lead", to, content, msg_type))
-
-
-async def _send_message_async(to: str, content: str, msg_type: str = "message") -> str:
-    """Async implementation of send_message."""
+    Returns:
+        Send confirmation
+    """
     bus = get_message_bus()
     return await bus.send("lead", to, content, msg_type)
 
 
-send_message = StructuredTool.from_function(
-    func=_send_message_sync,
-    coroutine=_send_message_async,
-    name="send_message",
-    description="Send a message to a teammate.",
-)
+@tool
+async def read_inbox() -> str:
+    """Read and clear the lead's inbox.
 
-
-def _read_inbox_sync() -> str:
-    """Sync wrapper for read_inbox."""
-    bus = get_message_bus()
-    messages = asyncio.run(bus.read_inbox("lead"))
-    return json.dumps(messages, indent=2)
-
-
-async def _read_inbox_async() -> str:
-    """Async implementation of read_inbox."""
+    Returns:
+        JSON string of messages
+    """
     bus = get_message_bus()
     messages = await bus.read_inbox("lead")
     return json.dumps(messages, indent=2)
 
 
-read_inbox = StructuredTool.from_function(
-    func=_read_inbox_sync,
-    coroutine=_read_inbox_async,
-    name="read_inbox",
-    description="Read and clear the lead's inbox.",
-)
+@tool
+async def broadcast(content: str) -> str:
+    """Broadcast message to all teammates.
 
+    Args:
+        content: Message content to broadcast
 
-def _broadcast_sync(content: str) -> str:
-    """Sync wrapper for broadcast."""
-    bus = get_message_bus()
-    tm = get_teammate_manager()
-    names = asyncio.run(tm.get_member_names())
-    return asyncio.run(bus.broadcast("lead", content, names))
-
-
-async def _broadcast_async(content: str) -> str:
-    """Async implementation of broadcast."""
+    Returns:
+        Broadcast confirmation
+    """
     bus = get_message_bus()
     tm = get_teammate_manager()
     names = await tm.get_member_names()
     return await bus.broadcast("lead", content, names)
 
 
-broadcast = StructuredTool.from_function(
-    func=_broadcast_sync,
-    coroutine=_broadcast_async,
-    name="broadcast",
-    description="Broadcast message to all teammates.",
-)
+@tool
+async def shutdown_request(teammate: str) -> str:
+    """Request a teammate to shut down.
 
+    Args:
+        teammate: Name of the teammate to shut down
 
-def _shutdown_request_sync(teammate: str) -> str:
-    """Sync wrapper for shutdown_request."""
-    tm = get_teammate_manager()
-    return asyncio.run(tm.shutdown(teammate))
-
-
-async def _shutdown_request_async(teammate: str) -> str:
-    """Async implementation of shutdown_request."""
+    Returns:
+        Shutdown confirmation
+    """
     tm = get_teammate_manager()
     return await tm.shutdown(teammate)
 
 
-shutdown_request = StructuredTool.from_function(
-    func=_shutdown_request_sync,
-    coroutine=_shutdown_request_async,
-    name="shutdown_request",
-    description="Request a teammate to shut down.",
-)
+@tool
+async def plan_approval(request_id: str, approve: bool, feedback: str = "") -> str:
+    """Approve or reject a teammate's plan.
 
+    Args:
+        request_id: Plan request ID
+        approve: Whether to approve
+        feedback: Optional feedback
 
-def _plan_approval_sync(request_id: str, approve: bool, feedback: str = "") -> str:
-    """Sync wrapper for plan_approval."""
-    pm = get_plan_manager()
-    return asyncio.run(pm.review(request_id, approve, feedback))
-
-
-async def _plan_approval_async(request_id: str, approve: bool, feedback: str = "") -> str:
-    """Async implementation of plan_approval."""
+    Returns:
+        Approval result
+    """
     pm = get_plan_manager()
     return await pm.review(request_id, approve, feedback)
-
-
-plan_approval = StructuredTool.from_function(
-    func=_plan_approval_sync,
-    coroutine=_plan_approval_async,
-    name="plan_approval",
-    description="Approve or reject a teammate's plan.",
-)
 
 
 @tool

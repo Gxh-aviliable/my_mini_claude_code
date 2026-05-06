@@ -1,4 +1,5 @@
-from typing import TypedDict, List, Dict, Any, Optional, Annotated
+from typing import Annotated, Any, Dict, List, Optional, TypedDict
+
 from langgraph.graph import add_messages
 
 
@@ -27,13 +28,6 @@ class AgentState(TypedDict):
     # 工具执行
     pending_tool_calls: List[Dict[str, Any]]
     tool_results: Dict[str, Any]
-
-    # 子代理
-    sub_agents: Dict[str, Any]
-
-    # 记忆引用
-    short_term_memory_ref: Optional[str]
-    long_term_memory_refs: List[str]
 
     # 工作流控制
     should_compress: bool

@@ -2,7 +2,6 @@ import redis.asyncio as redis
 
 from enterprise_agent.config.settings import settings
 
-
 # Redis connection pool
 redis_pool = redis.ConnectionPool(
     host=settings.REDIS_HOST,

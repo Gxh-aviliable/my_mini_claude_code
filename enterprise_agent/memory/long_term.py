@@ -4,17 +4,16 @@ Provides semantic search capability for conversation history and user patterns.
 Replaces MySQL-based long-term memory with vector-based storage.
 """
 
+import asyncio
 import json
 import uuid
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timezone
+from typing import Any, Dict, List
 
 from enterprise_agent.db.chroma import (
     get_conversations_collection,
     get_patterns_collection,
-    get_chroma_client,
 )
-from enterprise_agent.config.settings import settings
 from enterprise_agent.memory.base import MemoryBase
 
 
@@ -55,12 +54,13 @@ class ChromaLongTermMemory(MemoryBase):
             "user_id": self.user_id,
             "session_id": session_id,
             "role": role,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         if metadata:
             meta.update(metadata)
 
-        self.conversations.add(
+        await asyncio.to_thread(
+            self.conversations.add,
             documents=[content],
             metadatas=[meta],
             ids=[doc_id],
@@ -101,7 +101,8 @@ class ChromaLongTermMemory(MemoryBase):
             elif len(conditions) > 1:
                 where_filter = {"$and": conditions}
 
-        results = self.conversations.query(
+        results = await asyncio.to_thread(
+            self.conversations.query,
             query_texts=[query],
             n_results=n_results,
             where=where_filter,
@@ -134,7 +135,8 @@ class ChromaLongTermMemory(MemoryBase):
         Returns:
             List of messages in chronological order
         """
-        results = self.conversations.get(
+        results = await asyncio.to_thread(
+            self.conversations.get,
             where={"session_id": session_id},
             limit=limit,
         )
@@ -182,10 +184,11 @@ class ChromaLongTermMemory(MemoryBase):
             "pattern_type": pattern_type,
             "pattern_key": pattern_key,
             "confidence": confidence,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        self.patterns.add(
+        await asyncio.to_thread(
+            self.patterns.add,
             documents=[pattern_text],
             metadatas=[meta],
             ids=[pattern_id],
@@ -213,7 +216,8 @@ class ChromaLongTermMemory(MemoryBase):
         if pattern_type:
             where_filter["pattern_type"] = pattern_type
 
-        results = self.patterns.query(
+        results = await asyncio.to_thread(
+            self.patterns.query,
             query_texts=[query],
             n_results=n_results,
             where=where_filter,
@@ -239,7 +243,8 @@ class ChromaLongTermMemory(MemoryBase):
         Returns:
             List of all user patterns
         """
-        results = self.patterns.get(
+        results = await asyncio.to_thread(
+            self.patterns.get,
             where={"user_id": self.user_id},
         )
 
@@ -266,7 +271,8 @@ class ChromaLongTermMemory(MemoryBase):
 
     async def retrieve(self, key: str) -> Dict[str, Any]:
         """Retrieve data by key (generic interface)."""
-        results = self.conversations.get(
+        results = await asyncio.to_thread(
+            self.conversations.get,
             where={"key": key},
         )
 
@@ -276,13 +282,14 @@ class ChromaLongTermMemory(MemoryBase):
 
     async def delete(self, key: str) -> None:
         """Delete data by key (generic interface)."""
-        self.conversations.delete(
+        await asyncio.to_thread(
+            self.conversations.delete,
             where={"key": key},
         )
 
 
-# Global instance factory
-_long_term_memory: Optional[ChromaLongTermMemory] = None
+# Per-user instance cache (avoids race condition on global singleton)
+_long_term_memory_cache: Dict[int, ChromaLongTermMemory] = {}
 
 
 def get_long_term_memory(user_id: int = None) -> ChromaLongTermMemory:
@@ -294,9 +301,10 @@ def get_long_term_memory(user_id: int = None) -> ChromaLongTermMemory:
     Returns:
         ChromaLongTermMemory instance
     """
-    global _long_term_memory
+    if user_id is None:
+        return ChromaLongTermMemory(user_id=None)
 
-    if _long_term_memory is None or _long_term_memory.user_id != user_id:
-        _long_term_memory = ChromaLongTermMemory(user_id=user_id)
+    if user_id not in _long_term_memory_cache:
+        _long_term_memory_cache[user_id] = ChromaLongTermMemory(user_id=user_id)
 
-    return _long_term_memory
+    return _long_term_memory_cache[user_id]

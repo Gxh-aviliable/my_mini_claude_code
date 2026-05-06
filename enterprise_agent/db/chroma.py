@@ -4,13 +4,13 @@ Provides persistent vector storage with semantic search capability.
 Uses sentence-transformers for local embedding (all-MiniLM-L6-v2).
 """
 
+from pathlib import Path
+from typing import Optional
+
 import chromadb
 from chromadb.config import Settings as ChromaSettings
-from typing import Optional, List, Dict, Any
-from pathlib import Path
 
 from enterprise_agent.config.settings import settings
-
 
 # Global Chroma client
 _chroma_client: Optional[chromadb.Client] = None

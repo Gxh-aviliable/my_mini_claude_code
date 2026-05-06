@@ -1,5 +1,8 @@
+from pathlib import Path
+from typing import Optional
+
+from pydantic import model_validator
 from pydantic_settings import BaseSettings
-from typing import Optional, Literal
 
 
 class Settings(BaseSettings):
@@ -14,6 +17,9 @@ class Settings(BaseSettings):
     API_HOST: str = "0.0.0.0"
     API_PORT: int = 8000
 
+    # CORS
+    CORS_ORIGINS: str = "http://localhost:3000"
+
     # Database - MySQL (for auth/session only)
     MYSQL_HOST: str = "localhost"
     MYSQL_PORT: int = 3306
@@ -27,7 +33,7 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: Optional[str] = None
 
     # Database - Chroma (long-term vector memory)
-    CHROMA_PERSIST_DIR: str = "./chroma_data"
+    CHROMA_PERSIST_DIR: str = str(Path(__file__).resolve().parent.parent.parent / "chroma_data")
     CHROMA_COLLECTION_CONVERSATIONS: str = "conversations"
     CHROMA_COLLECTION_PATTERNS: str = "user_patterns"
 
@@ -38,7 +44,7 @@ class Settings(BaseSettings):
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
 
     # LLM Provider Configuration
-    # Supported: "anthropic" | "glm" | "deepseek" | "openai"
+    # Supported: "anthropic" | "glm" | "deepseek" | "openai" | "mimo"
     LLM_PROVIDER: str = "anthropic"
     LLM_API_KEY: str = ""  # Universal API key
     LLM_BASE_URL: Optional[str] = None  # Custom base URL for OpenAI-compatible APIs
@@ -52,10 +58,32 @@ class Settings(BaseSettings):
     MAX_MESSAGES_PER_SESSION: int = 100
     TOKEN_THRESHOLD: int = 100000
 
+    # Tool output limits
+    TOOL_OUTPUT_MAX_CHARS: int = 50000  # Truncation limit for tool outputs
+    CONTEXT_SUMMARY_TRIGGER_CHARS: int = 80000  # Auto-compact when messages exceed this
+
+    # Agent behavior
+    MICROCOMPACT_KEEP_LAST: int = 3  # Messages to keep during microcompact
+    NAG_REMINDER_THRESHOLD: int = 3  # Rounds without TodoWrite before reminder
+    COMMAND_TIMEOUT_SECONDS: int = 120  # Shell/background command timeout
+    SUBAGENT_MAX_ROUNDS: int = 30  # Max rounds for subagent execution
+    TODO_MAX_ITEMS: int = 20  # Max todo items per session
+    TODO_MAX_IN_PROGRESS: int = 1  # Max concurrent in_progress todos
+
     # Embedding (for Chroma)
     EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"  # Local sentence-transformers model
 
-    model_config = {"env_file": ".env", "case_sensitive": True}
+    model_config = {"env_file": ".env", "case_sensitive": True, "extra": "ignore"}
+
+    @model_validator(mode="after")
+    def validate_security(self):
+        """Validate security-sensitive settings at startup."""
+        if self.JWT_SECRET_KEY == "change-me-in-production":
+            raise ValueError(
+                "JWT_SECRET_KEY must be set in .env (not the default value). "
+                "Generate one with: python -c \"import secrets; print(secrets.token_urlsafe(32))\""
+            )
+        return self
 
     def get_effective_api_key(self) -> str:
         """Get effective API key based on provider or legacy config."""
@@ -82,17 +110,7 @@ class Settings(BaseSettings):
 
     def get_effective_model_id(self) -> str:
         """Get effective model ID based on provider."""
-        if self.MODEL_ID:
-            return self.MODEL_ID
-
-        # Default models for each provider
-        defaults = {
-            "anthropic": "claude-sonnet-4-6",
-            "glm": "glm-4",
-            "deepseek": "deepseek-chat",
-            "openai": "gpt-4",
-        }
-        return defaults.get(self.LLM_PROVIDER, "claude-sonnet-4-6")
+        return self.MODEL_ID
 
 
 settings = Settings()

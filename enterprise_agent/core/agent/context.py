@@ -9,13 +9,12 @@ Implements:
 
 import json
 import time
-from pathlib import Path
-from typing import List, Dict, Any, Optional
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from enterprise_agent.config.settings import settings
 from enterprise_agent.core.agent.llm_factory import get_llm
-
 
 # Transcript storage directory
 TRANSCRIPT_DIR_NAME = ".transcripts"
@@ -239,8 +238,8 @@ class ContextManager:
         # Extract last portion for summarization
         # Take last 80KB of text to fit in summarization context
         messages_text = json.dumps(messages, default=str)
-        if len(messages_text) > 80000:
-            messages_text = messages_text[-80000:]
+        if len(messages_text) > settings.CONTEXT_SUMMARY_TRIGGER_CHARS:
+            messages_text = messages_text[-settings.CONTEXT_SUMMARY_TRIGGER_CHARS:]
 
         # Generate summary
         summary_prompt = f"""Summarize the following conversation for context continuity.
@@ -298,6 +297,7 @@ _transcript_manager: Optional[TranscriptManager] = None
 
 def get_context_manager() -> ContextManager:
     """Get or create ContextManager instance."""
+    global _context_manager
     if _context_manager is None:
         _context_manager = ContextManager()
     return _context_manager
@@ -305,6 +305,7 @@ def get_context_manager() -> ContextManager:
 
 def get_transcript_manager() -> TranscriptManager:
     """Get or create TranscriptManager instance."""
+    global _transcript_manager
     if _transcript_manager is None:
         _transcript_manager = TranscriptManager()
     return _transcript_manager

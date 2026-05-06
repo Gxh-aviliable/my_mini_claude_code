@@ -8,6 +8,10 @@ dependencies = [
     "langgraph>=0.2.0",
     "langchain>=0.3.0",
     "langchain-anthropic>=0.3.0",
+    "langchain-openai>=1.2.1",
+    # Vector database
+    "chromadb>=0.4.0",
+    "sentence-transformers>=2.0.0",
     # API
     "fastapi>=0.115.0",
     "uvicorn[standard]>=0.32.0",
@@ -16,7 +20,6 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.0",
     "aiomysql>=0.2.0",
     "redis[asyncio]>=5.0.0",
-    "alembic>=1.14.0",
     # Auth
     "python-jose[cryptography]>=3.3.0",
     "passlib[bcrypt]>=1.7.4",
@@ -24,9 +27,8 @@ dependencies = [
     "pydantic-settings>=2.0.0",
     # Utils
     "python-dotenv>=1.0.0",
-    "pyyaml>=6.0.0",
-    "structlog>=25.0.0",
-    "langchain-openai>=1.2.1",
+    "langgraph-checkpoint-redis>=0.4.1",
+    "bcrypt<4.1",
 ]
 
 [project.optional-dependencies]
@@ -40,10 +42,18 @@ dev = [
 [project.scripts]
 serve = "enterprise_agent.api.main:run"
 
+[tool.setuptools.packages.find]
+include = ["enterprise_agent*"]
+
+[tool.uv]
+package = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
 [tool.ruff]
 line-length = 120
+
+[tool.ruff.lint]
 select = ["E", "F", "I", "N"]

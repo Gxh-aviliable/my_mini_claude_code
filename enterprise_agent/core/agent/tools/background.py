@@ -4,13 +4,18 @@ Provides tools for running long-running commands in background threads
 and checking their status later.
 """
 
-from langchain_core.tools import tool
-from typing import Optional
-from pathlib import Path
 import subprocess
 import threading
 import uuid
+from pathlib import Path
 from queue import Queue
+from typing import Optional
+
+from langchain_core.tools import tool
+
+from enterprise_agent.config.settings import settings
+from enterprise_agent.core.agent.tools.shell import validate_command
+from enterprise_agent.core.agent.tools.workspace import get_user_workspace
 
 
 class BackgroundManager:
@@ -20,12 +25,11 @@ class BackgroundManager:
     Notifications queue for completed task alerts.
     """
 
-    def __init__(self, workdir: Path = None):
-        self.workdir = workdir or Path.cwd()
+    def __init__(self):
         self.tasks: dict = {}
         self.notifications: Queue = Queue()
 
-    def run(self, command: str, timeout: int = 120) -> str:
+    def run(self, command: str, timeout: int = None) -> str:
         """Start a background task.
 
         Args:
@@ -35,6 +39,12 @@ class BackgroundManager:
         Returns:
             Task ID and status message
         """
+        if timeout is None:
+            timeout = settings.COMMAND_TIMEOUT_SECONDS
+        error = validate_command(command)
+        if error:
+            return f"Error: {error}"
+
         task_id = str(uuid.uuid4())[:8]
         self.tasks[task_id] = {
             "status": "running",
@@ -56,10 +66,11 @@ class BackgroundManager:
     def _execute(self, task_id: str, command: str, timeout: int) -> None:
         """Execute command in thread."""
         try:
+            workdir = get_user_workspace()
             result = subprocess.run(
                 command,
                 shell=True,
-                cwd=self.workdir,
+                cwd=workdir,
                 capture_output=True,
                 text=True,
                 timeout=timeout
@@ -67,7 +78,7 @@ class BackgroundManager:
             output = (result.stdout + result.stderr).strip()
             self.tasks[task_id].update({
                 "status": "completed",
-                "result": output[:50000] or "(no output)"
+                "result": output[:settings.TOOL_OUTPUT_MAX_CHARS] or "(no output)"
             })
         except subprocess.TimeoutExpired:
             self.tasks[task_id].update({
@@ -133,6 +144,7 @@ _bg_manager: Optional[BackgroundManager] = None
 
 def get_background_manager() -> BackgroundManager:
     """Get or create BackgroundManager instance."""
+    global _bg_manager
     if _bg_manager is None:
         _bg_manager = BackgroundManager()
     return _bg_manager
@@ -141,14 +153,14 @@ def get_background_manager() -> BackgroundManager:
 # === Tool Definitions ===
 
 @tool
-def background_run(command: str, timeout: int = 120) -> str:
+def background_run(command: str, timeout: int = None) -> str:
     """Run a command in background thread.
 
     Use check_background to get results later.
 
     Args:
         command: Shell command to execute
-        timeout: Maximum execution time in seconds (default 120)
+        timeout: Maximum execution time in seconds (default from settings)
 
     Returns:
         Task ID and start message
