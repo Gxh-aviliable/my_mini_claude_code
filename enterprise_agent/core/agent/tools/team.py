@@ -31,6 +31,7 @@ from typing import Dict, List, Optional
 from langchain_core.tools import tool
 
 from enterprise_agent.config.settings import settings
+from enterprise_agent.core.agent.tools.workspace import get_user_workspace
 
 # Directory paths for team coordination
 TEAM_DIR_NAME = ".team"
@@ -558,7 +559,7 @@ class TeammateManager:
     """Manages multiple autonomous teammate agents."""
 
     def __init__(self, workdir: Path = None):
-        self.workdir = workdir or Path.cwd()
+        self.workdir = workdir or get_user_workspace()
         self.team_dir = self.workdir / TEAM_DIR_NAME
         self.bus = AsyncMessageBus(self.team_dir)
         self.config = TeammateConfig(self.team_dir)
@@ -689,34 +690,40 @@ class PlanApprovalManager:
         return f"Plan {status} for '{request['from']}'"
 
 
-# Global instances
-_message_bus: Optional[AsyncMessageBus] = None
-_teammate_manager: Optional[TeammateManager] = None
-_plan_manager: Optional[PlanApprovalManager] = None
+# Per-user instances cache
+_message_buses: Dict[int, AsyncMessageBus] = {}
+_teammate_managers: Dict[int, TeammateManager] = {}
+_plan_managers: Dict[int, PlanApprovalManager] = {}
 
 
 def get_message_bus() -> AsyncMessageBus:
-    """Get or create AsyncMessageBus instance."""
-    global _message_bus
-    if _message_bus is None:
-        _message_bus = AsyncMessageBus()
-    return _message_bus
+    """Get or create AsyncMessageBus instance for current user."""
+    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
+    user_id = get_current_user_id()
+
+    if user_id not in _message_buses:
+        _message_buses[user_id] = AsyncMessageBus(get_user_workspace() / TEAM_DIR_NAME)
+    return _message_buses[user_id]
 
 
 def get_teammate_manager() -> TeammateManager:
-    """Get or create TeammateManager instance."""
-    global _teammate_manager
-    if _teammate_manager is None:
-        _teammate_manager = TeammateManager()
-    return _teammate_manager
+    """Get or create TeammateManager instance for current user."""
+    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
+    user_id = get_current_user_id()
+
+    if user_id not in _teammate_managers:
+        _teammate_managers[user_id] = TeammateManager()
+    return _teammate_managers[user_id]
 
 
 def get_plan_manager() -> PlanApprovalManager:
-    """Get or create PlanApprovalManager instance."""
-    global _plan_manager
-    if _plan_manager is None:
-        _plan_manager = PlanApprovalManager(get_message_bus())
-    return _plan_manager
+    """Get or create PlanApprovalManager instance for current user."""
+    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
+    user_id = get_current_user_id()
+
+    if user_id not in _plan_managers:
+        _plan_managers[user_id] = PlanApprovalManager(get_message_bus())
+    return _plan_managers[user_id]
 
 
 # === Tool Definitions ===

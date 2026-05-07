@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 from langchain_core.tools import tool
 
 from enterprise_agent.config.settings import settings
+from enterprise_agent.core.agent.tools.workspace import get_user_workspace
 
 # Task storage directory - relative to workspace
 TASKS_DIR_NAME = ".tasks"
@@ -29,7 +30,7 @@ class TaskManager:
     """
 
     def __init__(self, workdir: Path = None):
-        self.workdir = workdir or Path.cwd()
+        self.workdir = workdir or get_user_workspace()
         self.tasks_dir = self.workdir / TASKS_DIR_NAME
         self.tasks_dir.mkdir(exist_ok=True)
 
@@ -222,25 +223,29 @@ class TodoManager:
         return any(item.get("status") != "completed" for item in self.items)
 
 
-# Global instances
-_task_manager: Optional[TaskManager] = None
-_todo_manager: Optional[TodoManager] = None
+# Per-user instances cache
+_task_managers: Dict[int, TaskManager] = {}
+_todo_managers: Dict[int, TodoManager] = {}
 
 
 def get_task_manager() -> TaskManager:
-    """Get or create TaskManager instance."""
-    global _task_manager
-    if _task_manager is None:
-        _task_manager = TaskManager()
-    return _task_manager
+    """Get or create TaskManager instance for current user."""
+    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
+    user_id = get_current_user_id()
+
+    if user_id not in _task_managers:
+        _task_managers[user_id] = TaskManager()
+    return _task_managers[user_id]
 
 
 def get_todo_manager() -> TodoManager:
-    """Get or create TodoManager instance."""
-    global _todo_manager
-    if _todo_manager is None:
-        _todo_manager = TodoManager()
-    return _todo_manager
+    """Get or create TodoManager instance for current user."""
+    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
+    user_id = get_current_user_id()
+
+    if user_id not in _todo_managers:
+        _todo_managers[user_id] = TodoManager()
+    return _todo_managers[user_id]
 
 
 # === Tool Definitions ===

@@ -27,7 +27,10 @@ class TranscriptManager:
     """
 
     def __init__(self, workdir: Path = None):
-        self.workdir = workdir or Path.cwd()
+        if workdir is None:
+            from enterprise_agent.core.agent.tools.workspace import get_user_workspace
+            workdir = get_user_workspace()
+        self.workdir = workdir
         self.transcript_dir = self.workdir / TRANSCRIPT_DIR_NAME
         self.transcript_dir.mkdir(exist_ok=True)
 
@@ -116,7 +119,9 @@ class ContextManager:
         transcript_manager: TranscriptManager = None
     ):
         self.llm = llm or get_llm()
-        self.transcript_manager = transcript_manager or TranscriptManager()
+        if transcript_manager is None:
+            transcript_manager = TranscriptManager()
+        self.transcript_manager = transcript_manager
         self.token_threshold = settings.TOKEN_THRESHOLD
 
     def estimate_tokens(self, messages: List[Any]) -> int:
@@ -290,22 +295,26 @@ Continue working from this summary. Reference the transcript file if needed for 
         return await self.auto_compact(messages, session_id)
 
 
-# Global instance
-_context_manager: Optional[ContextManager] = None
-_transcript_manager: Optional[TranscriptManager] = None
+# Per-user instances cache
+_context_managers: Dict[int, ContextManager] = {}
+_transcript_managers: Dict[int, TranscriptManager] = {}
 
 
 def get_context_manager() -> ContextManager:
-    """Get or create ContextManager instance."""
-    global _context_manager
-    if _context_manager is None:
-        _context_manager = ContextManager()
-    return _context_manager
+    """Get or create ContextManager instance for current user."""
+    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
+    user_id = get_current_user_id()
+
+    if user_id not in _context_managers:
+        _context_managers[user_id] = ContextManager()
+    return _context_managers[user_id]
 
 
 def get_transcript_manager() -> TranscriptManager:
-    """Get or create TranscriptManager instance."""
-    global _transcript_manager
-    if _transcript_manager is None:
-        _transcript_manager = TranscriptManager()
-    return _transcript_manager
+    """Get or create TranscriptManager instance for current user."""
+    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
+    user_id = get_current_user_id()
+
+    if user_id not in _transcript_managers:
+        _transcript_managers[user_id] = TranscriptManager()
+    return _transcript_managers[user_id]
