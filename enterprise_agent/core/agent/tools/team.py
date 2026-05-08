@@ -86,7 +86,9 @@ class AsyncMessageBus:
     """
 
     def __init__(self, team_dir: Path = None):
-        self.team_dir = team_dir or (Path.cwd() / TEAM_DIR_NAME)
+        if team_dir is None:
+            team_dir = get_user_workspace() / TEAM_DIR_NAME
+        self.team_dir = team_dir
         self.inbox_dir = self.team_dir / INBOX_DIR_NAME
         self.inbox_dir.mkdir(parents=True, exist_ok=True)
         self._locks: Dict[str, asyncio.Lock] = {}
@@ -192,7 +194,9 @@ class TeammateConfig:
     """Manages team configuration persistence."""
 
     def __init__(self, team_dir: Path = None):
-        self.team_dir = team_dir or (Path.cwd() / TEAM_DIR_NAME)
+        if team_dir is None:
+            team_dir = get_user_workspace() / TEAM_DIR_NAME
+        self.team_dir = team_dir
         self.team_dir.mkdir(exist_ok=True)
         self.config_path = self.team_dir / CONFIG_FILE_NAME
         self._lock = asyncio.Lock()

@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from enterprise_agent.api.schemas.auth import TokenRefresh, TokenResponse, UserLogin, UserRegister
 from enterprise_agent.auth.jwt_handler import jwt_handler
 from enterprise_agent.auth.permissions import get_role_permissions
+from enterprise_agent.config.settings import settings
 from enterprise_agent.db.mysql import get_db
 from enterprise_agent.db.redis import redis_client
 from enterprise_agent.models.user import User
@@ -133,7 +134,7 @@ async def refresh_token(
 
     # Blacklist old refresh token (TTL = refresh token expiry)
     if old_jti:
-        ttl_seconds = 7 * 24 * 3600  # REFRESH_TOKEN_EXPIRE_DAYS
+        ttl_seconds = settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 3600
         await redis_client.setex(f"token:blacklist:{old_jti}", ttl_seconds, "1")
 
     role = "admin" if user.is_superuser else "free"

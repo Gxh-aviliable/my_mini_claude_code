@@ -16,6 +16,21 @@ from typing import Any, Dict, List, Optional
 from enterprise_agent.config.settings import settings
 from enterprise_agent.core.agent.llm_factory import get_llm
 
+
+def _extract_text(content: Any) -> str:
+    """Extract plain text from LLM response, which may be str or content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif hasattr(block, "text"):
+                parts.append(block.text)
+        return "\n".join(parts) if parts else str(content)
+    return str(content)
+
 # Transcript storage directory
 TRANSCRIPT_DIR_NAME = ".transcripts"
 
@@ -32,7 +47,7 @@ class TranscriptManager:
             workdir = get_user_workspace()
         self.workdir = workdir
         self.transcript_dir = self.workdir / TRANSCRIPT_DIR_NAME
-        self.transcript_dir.mkdir(exist_ok=True)
+        self.transcript_dir.mkdir(parents=True, exist_ok=True)
 
     def save(self, messages: List[Dict], session_id: str = None) -> Path:
         """Save messages to transcript file.
@@ -150,34 +165,43 @@ class ContextManager:
 
         return total_chars // 4
 
-    def microcompact(self, messages: List[Dict], keep_last: int = 3) -> List[Dict]:
-        """Clear old tool results to prevent output bloat.
+    def microcompact(self, messages: List[Any], keep_last: int = 3) -> List[Any]:
+        """Clear old tool result content to prevent output bloat.
 
-        Only clears tool_result content in user messages, keeping structure.
-        Preserves the most recent 'keep_last' tool results.
+        Handles both dict messages (``{"role": "tool", "content": "..."}``)
+        and LangChain ToolMessage objects. Preserves the most recent
+        ``keep_last`` tool results.
 
         Args:
-            messages: List of messages
+            messages: List of messages (dicts or LangChain objects)
             keep_last: Number of recent tool results to keep
 
         Returns:
             Modified messages list (in-place modification)
         """
-        # Find all tool_result blocks in user messages
-        tool_results = []
-        for i, msg in enumerate(messages):
-            if msg.get("role") == "user" and isinstance(msg.get("content"), list):
-                for part in msg.get("content", []):
-                    if isinstance(part, dict) and part.get("type") == "tool_result":
-                        tool_results.append((i, part))
+        # Count tool messages from the end
+        tool_count = 0
 
-        # Clear old tool results (keep last N)
-        if len(tool_results) <= keep_last:
-            return messages
+        for msg in reversed(messages):
+            is_tool = False
+            content = None
 
-        for idx, part in tool_results[:-keep_last]:
-            if isinstance(part.get("content"), str) and len(part.get("content", "")) > 100:
-                part["content"] = "[cleared - see transcript for full output]"
+            if isinstance(msg, dict):
+                is_tool = msg.get("role") == "tool"
+                content = msg.get("content", "")
+            elif hasattr(msg, "type") and getattr(msg, "type", "") == "tool":
+                is_tool = True
+                content = getattr(msg, "content", "")
+
+            if not is_tool:
+                continue
+
+            tool_count += 1
+            if tool_count > keep_last and isinstance(content, str) and len(content) > 100:
+                if isinstance(msg, dict):
+                    msg["content"] = "[cleared - see transcript for full output]"
+                else:
+                    msg.content = "[cleared - see transcript for full output]"
 
         return messages
 
@@ -188,6 +212,9 @@ class ContextManager:
     ) -> List[Any]:
         """Microcompact for LangChain message objects.
 
+        Delegates to :meth:`microcompact` which handles both dict and
+        LangChain message objects directly.
+
         Args:
             messages: List of LangChain message objects or dicts
             keep_last: Number of recent tool results to keep
@@ -195,29 +222,7 @@ class ContextManager:
         Returns:
             Modified messages list
         """
-        # Convert to dict format if needed, then process
-        dict_messages = []
-        for msg in messages:
-            if isinstance(msg, dict):
-                dict_messages.append(msg)
-            elif hasattr(msg, "type"):
-                # LangChain message
-                content = msg.content
-                if msg.type == "tool":
-                    dict_messages.append({
-                        "role": "tool",
-                        "content": str(content),
-                        "tool_call_id": getattr(msg, "tool_call_id", "")
-                    })
-                else:
-                    dict_messages.append({
-                        "role": msg.type,
-                        "content": str(content) if content else ""
-                    })
-            else:
-                dict_messages.append({"role": "unknown", "content": str(msg)})
-
-        return self.microcompact(dict_messages, keep_last)
+        return self.microcompact(messages, keep_last)
 
     async def auto_compact(
         self,
@@ -256,19 +261,24 @@ Conversation:
 Provide a concise summary that allows continuing the work seamlessly."""
 
         response = await self.llm.ainvoke([{"role": "user", "content": summary_prompt}])
-        summary = response.content
+        summary = _extract_text(response.content)
 
         # Return compressed state
         return {
             "compressed_messages": [
                 {
-                    "role": "system",
-                    "content": f"""[Context Compressed - Transcript saved to: {transcript_path}]
+                    "role": "user",
+                    "content": f"""<context_compressed transcript="{transcript_path}">
 
 Previous conversation summary:
 {summary}
 
-Continue working from this summary. Reference the transcript file if needed for detailed history."""
+## IMPORTANT: DO NOT STOP HERE
+You are in the middle of a task. This summary just restored your context.
+Immediately continue working on the next pending step from the summary above.
+Do NOT summarize or repeat this content — take the next concrete action NOW.
+Use a tool to move forward. Reference the transcript file if needed for detailed history.
+</context_compressed>"""
                 }
             ],
             "context_summary": summary,

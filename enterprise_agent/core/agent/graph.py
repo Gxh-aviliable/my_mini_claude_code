@@ -7,14 +7,16 @@ Builds the StateGraph that orchestrates the agent's behavior:
                          +-------------------------------------------------------------------+
                          |                    |                                              |
                     tool_executor         compress_context                               END
-                         |                    |
-                    save_memory          llm_call
+                         |
+                    save_memory
                          |
                     route_after_tool
                          |
                +---------+---------+
                |                   |
-          compress_context      llm_call
+          compress_context    pre_microcompact
+                                |
+                           llm_call
 
 State persistence is handled by RedisSaver (checkpointer), which automatically
 saves/restores the full AgentState (including messages) keyed by thread_id.
@@ -41,12 +43,14 @@ from enterprise_agent.core.agent.nodes import (
 from enterprise_agent.core.agent.state import AgentState
 
 # Dedicated Redis client for checkpointer (no decode_responses — binary protocol required)
+# NOTE: RediSearch (FT.CREATE) only works on db 0, so checkpointer shares db 0 with app Redis
 _checkpointer_pool = redis_async.ConnectionPool(
     host=settings.REDIS_HOST,
     port=settings.REDIS_PORT,
     password=settings.REDIS_PASSWORD,
     max_connections=10,
     decode_responses=False,
+    db=0,
 )
 _checkpointer_client = redis_async.Redis(connection_pool=_checkpointer_pool)
 
@@ -116,7 +120,7 @@ def build_agent_graph():
         }
     )
 
-    # Tool execution flow
+    # Tool execution flow — always run microcompact before next LLM call
     graph.add_edge("tool_executor", "save_memory")
     graph.add_conditional_edges(
         "save_memory",
@@ -124,7 +128,7 @@ def build_agent_graph():
         {
             "compress": "compress_context",
             "manual_compress": "manual_compress",
-            "llm_call": "llm_call"
+            "llm_call": "pre_microcompact"  # Run microcompact before returning to LLM
         }
     )
 
@@ -145,7 +149,7 @@ def build_simple_agent_graph():
     This is a simpler version for basic usage:
 
     init_context -> pre_microcompact -> llm_call -> route
-                                                -> tool_executor -> save -> llm_call
+                                                -> tool_executor -> save -> pre_microcompact -> llm_call
                                                 -> compress -> llm_call
                                                 -> END
 
@@ -179,7 +183,7 @@ def build_simple_agent_graph():
         }
     )
 
-    # Tool flow
+    # Tool flow — always run microcompact before next LLM call
     graph.add_edge("tool_executor", "save_memory")
     graph.add_conditional_edges(
         "save_memory",
@@ -187,7 +191,7 @@ def build_simple_agent_graph():
         {
             "compress": "compress_context",
             "manual_compress": END,  # Simplified: manual compress just ends
-            "llm_call": "llm_call"
+            "llm_call": "pre_microcompact"  # Run microcompact before returning to LLM
         }
     )
 

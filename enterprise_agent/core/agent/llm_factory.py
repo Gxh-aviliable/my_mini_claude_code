@@ -31,6 +31,32 @@ def _get_mimo_llm() -> BaseChatModel:
     )
 
 
+def _get_deepseek_llm() -> BaseChatModel:
+    """Create DeepSeek LLM.
+
+    Uses ChatAnthropic for the Anthropic-compatible endpoint
+    (/anthropic) or ChatOpenAI for the OpenAI-compatible endpoint.
+    """
+    base_url = settings.get_effective_base_url() or ""
+
+    if "/anthropic" in base_url:
+        from langchain_anthropic import ChatAnthropic
+
+        return ChatAnthropic(
+            model=settings.get_effective_model_id(),
+            api_key=settings.get_effective_api_key(),
+            base_url=base_url,
+        )
+
+    from langchain_openai import ChatOpenAI
+
+    return ChatOpenAI(
+        model=settings.get_effective_model_id(),
+        api_key=settings.get_effective_api_key(),
+        base_url=base_url,
+    )
+
+
 def _get_openai_compatible_llm(provider: str) -> BaseChatModel:
     """Create OpenAI-compatible LLM (GLM, DeepSeek, OpenAI)."""
     from langchain_openai import ChatOpenAI
@@ -66,7 +92,7 @@ def get_llm() -> BaseChatModel:
     providers = {
         "anthropic": _get_anthropic_llm,
         "glm": lambda: _get_openai_compatible_llm("glm"),
-        "deepseek": lambda: _get_openai_compatible_llm("deepseek"),
+        "deepseek": _get_deepseek_llm,
         "openai": lambda: _get_openai_compatible_llm("openai"),
         "mimo": _get_mimo_llm,
     }
@@ -115,10 +141,11 @@ PROVIDER_INFO = {
     },
     "deepseek": {
         "name": "DeepSeek",
-        "models": ["deepseek-chat", "deepseek-coder"],
+        "models": ["deepseek-v4-flash", "deepseek-chat", "deepseek-coder"],
         "tool_support": True,
         "embedding_support": False,
         "base_url": "https://api.deepseek.com",
+        "anthropic_base_url": "https://api.deepseek.com/anthropic",
     },
     "openai": {
         "name": "OpenAI",

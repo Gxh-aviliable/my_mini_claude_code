@@ -25,4 +25,4 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
 
 # Run
-CMD ["uv", "run", "python", "-m", "enterprise_agent.api.main"]
+CMD ["uv", "run", "serve"]

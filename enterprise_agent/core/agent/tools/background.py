@@ -9,7 +9,7 @@ import threading
 import uuid
 from pathlib import Path
 from queue import Queue
-from typing import Optional
+from typing import Dict, Optional
 
 from langchain_core.tools import tool
 
@@ -75,7 +75,7 @@ class BackgroundManager:
                 text=True,
                 timeout=timeout
             )
-            output = (result.stdout + result.stderr).strip()
+            output = ((result.stdout or "") + (result.stderr or "")).strip()
             self.tasks[task_id].update({
                 "status": "completed",
                 "result": output[:settings.TOOL_OUTPUT_MAX_CHARS] or "(no output)"
@@ -138,16 +138,17 @@ class BackgroundManager:
         return notifications
 
 
-# Global instance
-_bg_manager: Optional[BackgroundManager] = None
+# Per-user instances cache
+_bg_managers: Dict[int, BackgroundManager] = {}
 
 
 def get_background_manager() -> BackgroundManager:
-    """Get or create BackgroundManager instance."""
-    global _bg_manager
-    if _bg_manager is None:
-        _bg_manager = BackgroundManager()
-    return _bg_manager
+    """Get or create BackgroundManager instance for current user."""
+    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
+    user_id = get_current_user_id()
+    if user_id not in _bg_managers:
+        _bg_managers[user_id] = BackgroundManager()
+    return _bg_managers[user_id]
 
 
 # === Tool Definitions ===

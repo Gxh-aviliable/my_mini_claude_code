@@ -45,10 +45,11 @@ class Settings(BaseSettings):
 
     # LLM Provider Configuration
     # Supported: "anthropic" | "glm" | "deepseek" | "openai" | "mimo"
-    LLM_PROVIDER: str = "anthropic"
+    # DeepSeek supports both OpenAI-compatible (/v1) and Anthropic-compatible (/anthropic) endpoints
+    LLM_PROVIDER: str = "deepseek"
     LLM_API_KEY: str = ""  # Universal API key
-    LLM_BASE_URL: Optional[str] = None  # Custom base URL for OpenAI-compatible APIs
-    MODEL_ID: str = "claude-sonnet-4-6"  # Model identifier
+    LLM_BASE_URL: Optional[str] = "https://api.deepseek.com/anthropic"  # Anthropic-compatible endpoint
+    MODEL_ID: str = "deepseek-v4-flash"  # Model identifier
 
     # Legacy Anthropic config (for backward compatibility)
     ANTHROPIC_API_KEY: str = ""
@@ -56,19 +57,28 @@ class Settings(BaseSettings):
     # Memory
     SHORT_TERM_TTL_HOURS: int = 24
     MAX_MESSAGES_PER_SESSION: int = 100
-    TOKEN_THRESHOLD: int = 100000
+    TOKEN_THRESHOLD: int = 500000
 
     # Tool output limits
     TOOL_OUTPUT_MAX_CHARS: int = 50000  # Truncation limit for tool outputs
-    CONTEXT_SUMMARY_TRIGGER_CHARS: int = 80000  # Auto-compact when messages exceed this
+    # Auto-compact: how much recent text (chars) the summarizer LLM sees.
+    # With TOKEN_THRESHOLD=500K (~2M chars), 200K chars (~50K tokens) gives the
+    # summarizer enough context to produce a useful summary (~10% of full context).
+    CONTEXT_SUMMARY_TRIGGER_CHARS: int = 200000
 
     # Agent behavior
     MICROCOMPACT_KEEP_LAST: int = 3  # Messages to keep during microcompact
     NAG_REMINDER_THRESHOLD: int = 3  # Rounds without TodoWrite before reminder
     COMMAND_TIMEOUT_SECONDS: int = 120  # Shell/background command timeout
+    AGENT_INVOKE_TIMEOUT_SECONDS: int = 600  # Max seconds for a single graph invocation
+    MAX_AGENT_ROUNDS: int = 50  # Max LLM→tool rounds before forced stop
     SUBAGENT_MAX_ROUNDS: int = 30  # Max rounds for subagent execution
     TODO_MAX_ITEMS: int = 20  # Max todo items per session
     TODO_MAX_IN_PROGRESS: int = 1  # Max concurrent in_progress todos
+
+    # LangSmith tracing (optional — if API key is set, tracing auto-enables)
+    LANGSMITH_API_KEY: str = ""
+    LANGSMITH_PROJECT: str = "enterprise-agent"
 
     # Embedding (for Chroma)
     EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"  # Local sentence-transformers model

@@ -251,16 +251,16 @@ def get_todo_manager() -> TodoManager:
 # === Tool Definitions ===
 
 @tool
-def todo_update(items: List[Dict]) -> str:
+def todo_update(todos: List[Dict]) -> str:
     """Update todo list with status tracking.
 
     Args:
-        items: List of todo items with 'content', 'status', and 'activeForm' fields
+        todos: List of todo items with 'content', 'status', and 'activeForm' fields
 
     Returns:
         Rendered todo list string
     """
-    return get_todo_manager().update(items)
+    return get_todo_manager().update(todos)
 
 
 @tool

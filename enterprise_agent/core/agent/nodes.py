@@ -9,20 +9,27 @@ Node flow:
                          +----------------------------------------------------+
                          |                    |                               |
                     tool_executor         compress_context                END
-                         |                    |
-                    save_memory          llm_call
+                         |
+                    save_memory
                          |
                     route_after_tool
                          |
                +---------+---------+
                |                   |
-          compress_context      llm_call
+          compress_context    pre_microcompact
+                                   |
+                              llm_call
 
 State persistence (messages, todos, etc.) is handled automatically by
 RedisSaver checkpointer — no manual message loading/saving needed.
 """
 
+import asyncio
 import json
+import logging
+import os as _os
+import platform
+from pathlib import Path
 from typing import Any, Dict, List
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -35,6 +42,9 @@ from enterprise_agent.core.agent.tools import ALL_TOOLS
 
 # System prompts for different agent roles
 MAIN_SYSTEM_PROMPT = """You are an enterprise-grade AI assistant with access to powerful tools.
+
+## Environment
+{environment_info}
 
 ## Capabilities
 - **Shell execution**: Run commands via `bash` tool
@@ -50,7 +60,43 @@ MAIN_SYSTEM_PROMPT = """You are an enterprise-grade AI assistant with access to 
 3. Be concise and direct in your responses
 4. When spawning teammates, provide clear role descriptions and prompts
 5. Use background tasks for long-running operations
-6. If context gets too long, use the `compress` tool to summarize and continue"""
+6. If context gets too long, use the `compress` tool to summarize and continue
+7. Use Windows-compatible commands (cmd.exe shell) — avoid bash-isms like `pwd`, `ls`, `tail`, `/workspace` paths, `2>/dev/null`. Use `dir`, `cd /d`, `python` (not python3), and Windows path separators."""
+
+
+def _build_environment_info() -> str:
+    """Build environment info block for system prompt."""
+    from enterprise_agent.core.agent.tools.workspace import get_user_workspace
+    try:
+        workspace = get_user_workspace()
+    except Exception:
+        workspace = str(Path(_os.getcwd()))
+    return (
+        f"- OS: {platform.system()} ({platform.release()})\n"
+        f"- Shell: cmd.exe (Windows) — use Windows commands like `dir`, `cd /d`, `mkdir` (no -p)\n"
+        f"- Workspace: {workspace}\n"
+        f"- Python: {platform.python_version()}\n"
+        f"- Encoding: utf-8 (PYTHONIOENCODING=utf-8 is auto-set for all commands)"
+    )
+
+def _extract_text(content: Any) -> str:
+    """Extract plain text from LLM response content, which may be str or content blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+            elif hasattr(block, "text"):
+                parts.append(block.text)
+        return "\n".join(parts) if parts else str(content)
+    return str(content)
+
+
+# LLM retry configuration
+MAX_LLM_RETRIES = 3
+RETRY_BASE_DELAY = 2.0  # seconds
 
 # Lazy LLM initialization (avoids crash at import time if API key not set)
 _llm = None
@@ -89,10 +135,17 @@ def _convert_to_langchain_messages(messages: List[Any]) -> List[Any]:
             role = msg.get("role", "user")
             content = msg.get("content", "")
 
-            if role == "user":
+            if role in ("user", "human"):
                 result.append(HumanMessage(content=content))
-            elif role == "assistant":
-                result.append(AIMessage(content=content))
+            elif role in ("assistant", "ai"):
+                tool_calls = msg.get("tool_calls", [])
+                # Preserve original content blocks (e.g., thinking blocks from
+                # DeepSeek's thinking mode) if they were stored during conversion.
+                content_blocks = msg.get("content_blocks")
+                if content_blocks is not None:
+                    result.append(AIMessage(content=content_blocks, tool_calls=tool_calls))
+                else:
+                    result.append(AIMessage(content=content, tool_calls=tool_calls))
             elif role == "system":
                 result.append(SystemMessage(content=content))
             elif role == "tool":
@@ -122,7 +175,20 @@ def _convert_from_langchain_messages(messages: List[Any]) -> List[Dict]:
     for msg in messages:
         if hasattr(msg, "type"):
             role = msg.type
-            content = str(msg.content) if msg.content else ""
+            raw_content = msg.content
+
+            # Preserve list-type content (e.g. thinking blocks from
+            # DeepSeek/Anthropic extended thinking) as-is.
+            # _extract_text() strips thinking blocks, which causes
+            # DeepSeek API to return 400: "The `content[].thinking`
+            # in the thinking mode must be passed back to the API."
+            # Storing the list directly ensures the add_messages
+            # reducer round-trips it correctly.
+            if isinstance(raw_content, list):
+                content = raw_content
+            else:
+                content = _extract_text(raw_content) if raw_content else ""
+
             tool_call_id = getattr(msg, "tool_call_id", None)
 
             entry = {"role": role, "content": content}
@@ -159,6 +225,8 @@ async def init_context_node(state: AgentState) -> Dict[str, Any]:
         "token_count": 0,
         "pending_tool_calls": [],
         "tool_results": {},
+        "tool_call_stats": {},
+        "round_count": 0,
         "should_compress": False,
         "should_end": False,
         # TodoWrite nag reminder state
@@ -191,6 +259,12 @@ async def init_context_node(state: AgentState) -> Dict[str, Any]:
                 )
 
                 if past_conversations:
+                    # NOTE: This system message is appended by the add_messages
+                    # reducer (AgentState.messages), ending up AFTER the current
+                    # user message. This is functionally correct because
+                    # llm_call_node passes ALL messages to the LLM, including
+                    # this context. The MAIN_SYSTEM_PROMPT is inserted at index
+                    # 0 during conversion.
                     context_parts = []
                     for conv in past_conversations:
                         role = conv.get("metadata", {}).get("role", "unknown")
@@ -204,7 +278,7 @@ async def init_context_node(state: AgentState) -> Dict[str, Any]:
                         context_text = context_text[:2000] + "..."
 
                     result["messages"] = [{
-                        "role": "system",
+                        "role": "user",
                         "content": (
                             "<long_term_memory>\n"
                             "以下是与当前问题相关的历史对话记录，供参考：\n"
@@ -213,7 +287,7 @@ async def init_context_node(state: AgentState) -> Dict[str, Any]:
                         )
                     }]
             except Exception:
-                pass  # Chroma 故障不影响主流程
+                logging.warning("Chroma memory search failed (non-fatal)", exc_info=True)
 
     return result
 
@@ -237,16 +311,52 @@ async def llm_call_node(state: AgentState) -> Dict[str, Any]:
     """LLM call node - Invoke LLM with tools bound.
 
     Handles both text responses and tool use requests.
+    Intermediate system-level context (memory, background, inbox) uses
+    role="user" with XML tags so MAIN_SYSTEM_PROMPT stays the sole SystemMessage.
     """
     messages = state.get("messages", [])
+
+    # Strip any stray system messages from state before conversion.
+    # Anthropic API requires all SystemMessage instances to be consecutive
+    # at the start — any system-role message in the middle would break.
+    # Only MAIN_SYSTEM_PROMPT (injected below) is the allowed SystemMessage.
+    messages = [
+        m for m in messages
+        if not (isinstance(m, dict) and m.get("role") == "system")
+        and not (hasattr(m, "type") and getattr(m, "type", "") == "system")
+    ]
 
     # Convert to LangChain format for invocation
     lc_messages = _convert_to_langchain_messages(messages)
 
-    # Inject system prompt as the first message
-    lc_messages.insert(0, SystemMessage(content=MAIN_SYSTEM_PROMPT))
+    # Insert system prompt as the sole SystemMessage at the beginning.
+    # Inject live environment info (OS, shell, workspace, encoding) so the
+    # agent doesn't waste rounds discovering the environment.
+    lc_messages.insert(0, SystemMessage(content=MAIN_SYSTEM_PROMPT.format(
+        environment_info=_build_environment_info()
+    )))
 
-    response = await get_llm_with_tools().ainvoke(lc_messages)
+    # Log: entering LLM call
+    msg_count = len(lc_messages)
+    total_chars = sum(len(str(m.content)) if hasattr(m, "content") else 0 for m in lc_messages)
+    logging.info(f"[llm_call] {msg_count} messages (~{total_chars} chars, ~{state.get('token_count', 0)} tokens) → invoking LLM...")
+
+    # LLM call with retry on transient failures
+    for attempt in range(MAX_LLM_RETRIES):
+        try:
+            response = await get_llm_with_tools().ainvoke(lc_messages)
+            break
+        except Exception as e:
+            if attempt < MAX_LLM_RETRIES - 1:
+                delay = RETRY_BASE_DELAY * (2 ** attempt)
+                logging.warning(
+                    f"LLM call failed (attempt {attempt+1}/{MAX_LLM_RETRIES}): {e}. "
+                    f"Retrying in {delay}s..."
+                )
+                await asyncio.sleep(delay)
+            else:
+                logging.exception(f"LLM call failed after {MAX_LLM_RETRIES} attempts")
+                raise
 
     # Extract tool calls if present
     tool_calls = []
@@ -259,6 +369,11 @@ async def llm_call_node(state: AgentState) -> Dict[str, Any]:
             }
             for tc in response.tool_calls
         ]
+        for tc in tool_calls:
+            logging.info(f"[llm_call] → tool: {tc['name']}({json.dumps(tc['args'], ensure_ascii=False)[:200]})")
+    else:
+        text_preview = str(response.content)[:150] if hasattr(response, "content") and response.content else "(empty)"
+        logging.info(f"[llm_call] → text response: {text_preview}")
 
     # Track token usage
     token_count = state.get("token_count", 0)
@@ -273,11 +388,40 @@ async def llm_call_node(state: AgentState) -> Dict[str, Any]:
     # Convert response back to dict format
     response_dict = _convert_from_langchain_messages([response])[0]
 
+    round_count = state.get("round_count", 0) + 1
+    logging.info(f"[llm_call] round {round_count}/{settings.MAX_AGENT_ROUNDS}")
+
     return {
         "messages": [response_dict],
         "pending_tool_calls": tool_calls,
-        "token_count": token_count
+        "token_count": token_count,
+        "round_count": round_count,
     }
+
+
+# Tools that are safe to retry (read-only, no side effects)
+IDEMPOTENT_TOOLS = {
+    "read_file", "list_skills", "list_teammates", "list_transcripts",
+    "get_transcript", "context_status", "check_background", "read_inbox",
+    "task_list", "task_get",
+}
+
+# Error patterns that indicate transient failures worth retrying
+RETRYABLE_ERROR_PATTERNS = ("timeout", "connection", "rate limit", "try again")
+
+MAX_TOOL_RETRIES = 2
+
+
+def _should_retry_tool(tool_name: str, error: Exception) -> bool:
+    """Only retry idempotent (read-only) tools on transient errors.
+
+    Tools with side effects (write_file, bash, edit_file, etc.) are never
+    retried because re-executing them would duplicate the side effect.
+    """
+    if tool_name not in IDEMPOTENT_TOOLS:
+        return False
+    error_str = str(error).lower()
+    return any(pattern in error_str for pattern in RETRYABLE_ERROR_PATTERNS)
 
 
 async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
@@ -286,8 +430,10 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
     Runs each tool and collects results.
     Special handling for compress tool to trigger compression.
     Tracks TodoWrite usage for nag reminder mechanism.
+
+    Idempotent (read-only) tools are retried on transient errors.
+    Side-effect tools (write, bash, etc.) are never retried.
     """
-    from enterprise_agent.core.agent.tools import ALL_TOOLS
     from enterprise_agent.core.agent.tools.task import get_todo_manager
 
     results = {}
@@ -295,15 +441,29 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
     compress_requested = False
     used_todo = False
 
-    for tool_call in state.get("pending_tool_calls", []):
+    pending = state.get("pending_tool_calls", [])
+    tool_call_stats = state.get("tool_call_stats", {}).copy()  # mutable state: copy before modifying
+    logging.info(f"[tool_exec] executing {len(pending)} tool(s): {[tc.get('name') for tc in pending]}")
+
+    for tool_call in pending:
         tool_name = tool_call.get("name")
         tool_input = tool_call.get("args", {})
         tool_id = tool_call.get("id", tool_name)
 
-        if tool_name in tool_map:
+        # Auto-increment tool call stats (framework counts, no LLM hallucination)
+        tool_call_stats[tool_name] = tool_call_stats.get(tool_name, 0) + 1
+
+        if tool_name not in tool_map:
+            results[tool_id] = f"Unknown tool: {tool_name}"
+            logging.warning(f"[tool_exec] unknown tool: {tool_name}")
+            continue
+
+        tool = tool_map[tool_name]
+        last_error = None
+
+        for attempt in range(MAX_TOOL_RETRIES):
             try:
                 # Invoke tool (tools may be sync or async)
-                tool = tool_map[tool_name]
                 if hasattr(tool, "ainvoke"):
                     result = await tool.ainvoke(tool_input)
                 else:
@@ -324,10 +484,22 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
                         result_str = result_str[:settings.TOOL_OUTPUT_MAX_CHARS] + "\n... (truncated, see transcript)"
 
                 results[tool_id] = result_str
+                result_preview = result_str[:120].replace("\n", " ")
+                logging.info(f"[tool_exec] ✓ {tool_name} ({len(result_str)} chars): {result_preview}...")
+                break
             except Exception as e:
-                results[tool_id] = f"Error executing {tool_name}: {e}"
-        else:
-            results[tool_id] = f"Unknown tool: {tool_name}"
+                last_error = e
+                if attempt < MAX_TOOL_RETRIES - 1 and _should_retry_tool(tool_name, e):
+                    delay = 1.0 * (attempt + 1)
+                    logging.warning(
+                        f"Retrying idempotent tool '{tool_name}' after error: {e} "
+                        f"(attempt {attempt+1}/{MAX_TOOL_RETRIES})"
+                    )
+                    await asyncio.sleep(delay)
+                else:
+                    results[tool_id] = f"Error executing {tool_name}: {e}"
+                    logging.warning(f"[tool_exec] ✗ {tool_name} FAILED: {e}")
+                    break
 
     # Build tool result messages
     tool_result_messages = []
@@ -346,6 +518,7 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
         "tool_results": results,
         "pending_tool_calls": [],
         "messages": tool_result_messages,
+        "tool_call_stats": tool_call_stats,  # Framework auto-counted stats
         "should_compress": compress_requested,  # Trigger compression if requested
         "used_todo_last_round": used_todo,
         "has_open_todos": has_open_todos,
@@ -356,8 +529,9 @@ async def save_memory_node(state: AgentState) -> Dict[str, Any]:
     """Save memory node - handles TodoWrite nag reminder logic.
 
     Message persistence is handled automatically by RedisSaver checkpointer.
-    This node only manages the nag reminder mechanism (s03):
-    tracks rounds without todo usage and injects reminder messages when needed.
+    This node also injects auto-counted tool_call_stats when the agent
+    completes all todos (wrapping up), so the LLM can report accurate
+    tool usage counts instead of hallucinating.
     """
     # === TodoWrite nag reminder mechanism (s03) ===
     used_todo = state.get("used_todo_last_round", False)
@@ -373,6 +547,24 @@ async def save_memory_node(state: AgentState) -> Dict[str, Any]:
             "content": "<reminder>Update your todos. You have open todo items that need status updates.</reminder>"
         })
         rounds_without_todo = 0
+
+    # Inject auto-counted tool stats when agent finishes all todos.
+    # The LLM self-reports tool counts unreliably (e.g. 24 vs actual 37).
+    # Framework-counted stats are injected once as ground truth.
+    tool_stats = state.get("tool_call_stats", {})
+    if tool_stats and not has_open_todos and used_todo:
+        total = sum(tool_stats.values())
+        stats_text = "\n".join(f"- {name}: {count}" for name, count in sorted(tool_stats.items()))
+        additional_messages.append({
+            "role": "user",
+            "content": (
+                f"<tool_stats>\n"
+                f"Framework-counted tool usage (accurate, use these numbers):\n"
+                f"{stats_text}\n"
+                f"Total: {total} tool calls\n"
+                f"</tool_stats>"
+            )
+        })
 
     return {
         "rounds_without_todo": rounds_without_todo,
@@ -411,14 +603,22 @@ async def compress_context_node(state: AgentState) -> Dict[str, Any]:
                 await memory.store_conversation(
                     session_id=session_id,
                     role="system",
-                    content=summary,
+                    content=_extract_text(summary),
                     metadata={"type": "session_summary"},
                 )
             except Exception:
-                pass  # Chroma 故障不影响主流程
+                logging.warning("Chroma memory store failed during compression (non-fatal)", exc_info=True)
+
+        # Append explicit continuation instruction so the LLM doesn't just
+        # echo the summary and stop — it receives a clear prompt to act.
+        compressed_msgs = compression_result["compressed_messages"]
+        compressed_msgs.append({
+            "role": "user",
+            "content": "<system-reminder>Context has been compressed. Continue the task immediately. Take the next concrete action using a tool — do NOT summarize or repeat what was in the compressed context.</system-reminder>"
+        })
 
         return {
-            "messages": compression_result["compressed_messages"],
+            "messages": compressed_msgs,
             "context_summary": summary,
             "transcript_path": compression_result["transcript_path"],
             "token_count": compression_result["token_count_reset"],
@@ -450,11 +650,11 @@ async def manual_compress_node(state: AgentState) -> Dict[str, Any]:
             await memory.store_conversation(
                 session_id=session_id,
                 role="system",
-                content=summary,
+                content=_extract_text(summary),
                 metadata={"type": "session_summary"},
             )
         except Exception:
-            pass  # Chroma 故障不影响主流程
+            logging.warning("Chroma memory store failed during manual compression (non-fatal)", exc_info=True)
 
     return {
         "messages": compression_result["compressed_messages"],
@@ -470,16 +670,22 @@ def route_after_llm(state: AgentState) -> str:
     """Route after LLM call based on state.
 
     Determines next node based on:
+    - Max rounds exceeded -> end
     - Has tool calls -> tool_executor
     - Exceeds token threshold -> compress_context
     - Otherwise -> end
     """
+    # Safety valve: stop if agent has been looping too long
+    if state.get("round_count", 0) >= settings.MAX_AGENT_ROUNDS:
+        logging.warning(f"[route_after_llm] max rounds ({settings.MAX_AGENT_ROUNDS}) reached, ending")
+        return "end"
+
     # Check for tool calls first
     if state.get("pending_tool_calls"):
         return "tool_call"
 
-    # Check for manual compression request
-    if state.get("should_compress") and not state.get("token_count", 0) > settings.TOKEN_THRESHOLD:
+    # Check for manual compression request (token not yet exceeded threshold)
+    if state.get("should_compress") and state.get("token_count", 0) <= settings.TOKEN_THRESHOLD:
         return "manual_compress"
 
     # Check for auto compression threshold
@@ -493,10 +699,16 @@ def route_after_tool(state: AgentState) -> str:
     """Route after tool execution.
 
     After tools run, we check if:
+    - Max rounds exceeded -> end
     - Manual compression was requested via compress tool
     - Auto compression threshold exceeded
     before going back to LLM.
     """
+    # Safety valve: stop if agent has been looping too long
+    if state.get("round_count", 0) >= settings.MAX_AGENT_ROUNDS:
+        logging.warning(f"[route_after_tool] max rounds ({settings.MAX_AGENT_ROUNDS}) reached, ending")
+        return "end"
+
     # Check for manual compression request first
     if state.get("should_compress"):
         return "manual_compress"
@@ -527,7 +739,7 @@ async def check_background_node(state: AgentState) -> Dict[str, Any]:
         )
         return {
             "messages": [{
-                "role": "system",
+                "role": "user",
                 "content": f"<background-results>\n{notification_text}\n</background-results>"
             }]
         }
@@ -549,7 +761,7 @@ async def check_inbox_node(state: AgentState) -> Dict[str, Any]:
         inbox_text = json.dumps(messages, indent=2)
         return {
             "messages": [{
-                "role": "system",
+                "role": "user",
                 "content": f"<inbox>\n{inbox_text}\n</inbox>"
             }]
         }

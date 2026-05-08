@@ -107,16 +107,17 @@ class SkillLoader:
         return f"Reloaded {len(self.skills)} skills"
 
 
-# Global instance
-_skill_loader: Optional[SkillLoader] = None
+# Per-user instances cache
+_skill_loaders: Dict[int, SkillLoader] = {}
 
 
 def get_skill_loader() -> SkillLoader:
-    """Get or create SkillLoader instance."""
-    global _skill_loader
-    if _skill_loader is None:
-        _skill_loader = SkillLoader()
-    return _skill_loader
+    """Get or create SkillLoader instance for current user."""
+    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
+    user_id = get_current_user_id()
+    if user_id not in _skill_loaders:
+        _skill_loaders[user_id] = SkillLoader()
+    return _skill_loaders[user_id]
 
 
 @tool

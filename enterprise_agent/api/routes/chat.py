@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 
@@ -9,10 +11,28 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from enterprise_agent.api.middleware.auth import get_current_user
 from enterprise_agent.api.schemas.chat import ChatRequest, ChatResponse, SessionCreate, SessionResponse
+from enterprise_agent.config.settings import settings
 from enterprise_agent.core.agent.graph import get_agent_graph
 from enterprise_agent.core.agent.tools.workspace import set_current_user_id
 from enterprise_agent.db.mysql import get_db
 from enterprise_agent.models.session import Session, SessionStatus
+
+def _extract_delta(content) -> str:
+    """Extract plain text delta from chunk content, which may be str or list of blocks."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                t = block.get("text", "")
+                if t:
+                    parts.append(t)
+            elif hasattr(block, "text"):
+                parts.append(block.text)
+        return "".join(parts)
+    return str(content) if content else ""
+
 
 router = APIRouter(prefix="/chat", tags=["chat"])
 
@@ -37,14 +57,20 @@ async def chat_completion(
     set_current_user_id(user_id)
 
     # Execute agent graph with thread_id for state persistence
-    result = await get_agent_graph().ainvoke(
-        {
-            "session_id": session_id,
-            "user_id": user_id,
-            "messages": [{"role": "user", "content": request.content}]
-        },
-        config={"configurable": {"thread_id": session_id}}
-    )
+    try:
+        result = await asyncio.wait_for(
+            get_agent_graph().ainvoke(
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "messages": [{"role": "user", "content": request.content}]
+                },
+                config={"configurable": {"thread_id": session_id}}
+            ),
+            timeout=settings.AGENT_INVOKE_TIMEOUT_SECONDS
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Request timed out")
 
     # Get last message (guard against empty messages)
     messages = result.get("messages", [])
@@ -57,7 +83,6 @@ async def chat_completion(
         raw_content = last_msg.content
 
         # Debug logging
-        import logging
         logging.debug(f"Content type: {type(raw_content)}, content: {raw_content}")
 
         # If content is a list of blocks (Anthropic format), extract text
@@ -69,7 +94,7 @@ async def chat_completion(
                         text_parts.append(block.get("text", ""))
                 elif hasattr(block, "text"):
                     text_parts.append(block.text)
-            content = "\n".join(text_parts) if text_parts else str(raw_content)
+            content = "\n".join(text_parts) if text_parts else "(thinking only — no text response)"
         elif isinstance(raw_content, str):
             # Try to parse if it looks like a list representation
             if raw_content.startswith("[") and raw_content.endswith("]"):
@@ -81,7 +106,7 @@ async def chat_completion(
                         for block in parsed:
                             if isinstance(block, dict) and block.get("type") == "text":
                                 text_parts.append(block.get("text", ""))
-                        content = "\n".join(text_parts) if text_parts else raw_content
+                        content = "\n".join(text_parts) if text_parts else "(thinking only — no text response)"
                     else:
                         content = raw_content
                 except:
@@ -121,23 +146,48 @@ async def chat_stream(
     set_current_user_id(user_id)
 
     async def generate():
-        # Stream agent execution with thread_id for state persistence
-        async for event in get_agent_graph().astream_events(
-            {
-                "session_id": session_id,
-                "user_id": user_id,
-                "messages": [{"role": "user", "content": request.content}]
-            },
-            config={"configurable": {"thread_id": session_id}},
-            version="v1"
-        ):
-            if event.get("event") == "on_chain_stream":
-                chunk = event.get("data", {}).get("chunk")
-                if chunk:
-                    delta = chunk.content if hasattr(chunk, "content") else str(chunk)
-                    yield f"data: {json.dumps({'delta': delta})}\n\n"
+        streamed_text = False
+        try:
+            # Stream agent execution with thread_id for state persistence
+            async for event in get_agent_graph().astream_events(
+                {
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "messages": [{"role": "user", "content": request.content}]
+                },
+                config={"configurable": {"thread_id": session_id}},
+                version="v2"
+            ):
+                kind = event.get("event", "")
+                if kind == "on_chat_model_stream":
+                    chunk = event.get("data", {}).get("chunk")
+                    if chunk and hasattr(chunk, "content") and chunk.content:
+                        delta = _extract_delta(chunk.content)
+                        if delta:
+                            streamed_text = True
+                            yield f"data: {json.dumps({'delta': delta})}\n\n"
+                elif kind == "on_chat_model_end":
+                    # Fallback: if no streaming deltas were emitted (e.g. ainvoke
+                    # without streaming support), send the full output at end.
+                    if not streamed_text:
+                        output = event.get("data", {}).get("output")
+                        if output and hasattr(output, "content") and output.content:
+                            text = _extract_delta(output.content)
+                            if text:
+                                yield f"data: {json.dumps({'delta': text})}\n\n"
+                elif kind == "on_tool_start":
+                    yield f"data: {json.dumps({'event': 'tool_start', 'name': event.get('name', '')})}\n\n"
+                elif kind == "on_tool_end":
+                    yield f"data: {json.dumps({'event': 'tool_end', 'name': event.get('name', '')})}\n\n"
+                elif kind == "on_chain_error":
+                    err_msg = str(event.get("data", {}).get("error", "Unknown chain error"))
+                    logging.error("Chain error in stream: %s", err_msg)
+                    yield f"data: {json.dumps({'error': err_msg})}\n\n"
 
-        yield "data: [DONE]\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logging.exception("Stream error: %s", e)
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

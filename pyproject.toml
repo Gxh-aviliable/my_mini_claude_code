@@ -35,6 +35,8 @@ dependencies = [
 dev = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.25.0",
+    "pytest-mock>=3.14.0",
+    "pytest-cov>=5.0.0",
     "httpx>=0.28.0",
     "ruff>=0.1.0",
 ]
@@ -57,3 +59,9 @@ line-length = 120
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N"]
+
+[dependency-groups]
+dev = [
+    "pytest-cov>=7.1.0",
+    "pytest-mock>=3.15.1",
+]

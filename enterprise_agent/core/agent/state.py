@@ -28,8 +28,10 @@ class AgentState(TypedDict):
     # 工具执行
     pending_tool_calls: List[Dict[str, Any]]
     tool_results: Dict[str, Any]
+    tool_call_stats: Dict[str, int]  # 框架自动统计工具调用次数，避免LLM幻觉
 
     # 工作流控制
+    round_count: int  # LLM调用轮次计数，防止无限循环
     should_compress: bool
     should_end: bool
 

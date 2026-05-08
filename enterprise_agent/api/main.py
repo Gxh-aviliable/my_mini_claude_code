@@ -1,5 +1,8 @@
 import logging
+import os
 from contextlib import asynccontextmanager
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,21 +13,41 @@ from enterprise_agent.api.routes.chat import router as chat_router
 from enterprise_agent.api.routes.chat import sessions_router
 from enterprise_agent.config.settings import settings
 from enterprise_agent.db.chroma import init_chroma
-from enterprise_agent.db.mysql import close_db
+from enterprise_agent.db.mysql import close_db, init_db
 from enterprise_agent.db.redis import close_redis
+
+
+logger = logging.getLogger("enterprise_agent")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan - startup and shutdown"""
     # Startup
-    # Initialize Chroma vector database
+    # LangSmith tracing (optional — only enables if API key is configured)
+    if settings.LANGSMITH_API_KEY:
+        os.environ["LANGCHAIN_TRACING_V2"] = "true"
+        os.environ["LANGCHAIN_API_KEY"] = settings.LANGSMITH_API_KEY
+        os.environ["LANGCHAIN_PROJECT"] = settings.LANGSMITH_PROJECT
+        logger.info("LangSmith tracing enabled (project: %s)", settings.LANGSMITH_PROJECT)
+
+    logger.info("Initializing MySQL tables...")
+    await init_db()
+    logger.info("MySQL tables ready")
+
+    logger.info("Initializing Chroma vector database (downloading embedding model on first run)...")
     init_chroma()
-    # Initialize RedisSaver checkpointer (sets up Redis indexes)
+    logger.info("Chroma vector database ready")
+
+    logger.info("Initializing Redis checkpointer...")
     from enterprise_agent.core.agent.graph import setup_checkpointer
     await setup_checkpointer()
+    logger.info("Redis checkpointer ready")
+
+    logger.info("Application startup complete")
     yield
     # Shutdown
+    logger.info("Shutting down...")
     await close_db()
     await close_redis()
 
@@ -37,7 +60,11 @@ app = FastAPI(
 )
 
 # CORS middleware
-origins = [o.strip() for o in settings.CORS_ORIGINS.split(",")]
+origins_str = settings.CORS_ORIGINS
+if origins_str:
+    origins = [o.strip() for o in origins_str.split(",") if o.strip()]
+else:
+    origins = ["*"]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,

@@ -73,7 +73,7 @@ def resolve_path(path: str, user_id: int = None) -> Path:
     Raises:
         ValueError: If path escapes workspace
     """
-    workdir = get_user_workspace(user_id)
+    workdir = get_user_workspace(user_id).resolve()
 
     # Handle absolute paths
     if Path(path).is_absolute():
@@ -82,6 +82,7 @@ def resolve_path(path: str, user_id: int = None) -> Path:
         resolved = (workdir / path).resolve()
 
     # Security check: ensure path is within workspace
+    # .resolve() on both sides ensures consistent drive letters on Windows
     if not resolved.is_relative_to(workdir):
         raise ValueError(f"Path escapes workspace: {path}")
 
