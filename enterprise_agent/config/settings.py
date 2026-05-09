@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     LLM_PROVIDER: str = "deepseek"
     LLM_API_KEY: str = ""  # Universal API key
     LLM_BASE_URL: Optional[str] = "https://api.deepseek.com/anthropic"  # Anthropic-compatible endpoint
-    MODEL_ID: str = "deepseek-v4-flash"  # Model identifier
+    MODEL_ID: str = "deepseek-v4-pro"  # Model identifier
 
     # Legacy Anthropic config (for backward compatibility)
     ANTHROPIC_API_KEY: str = ""

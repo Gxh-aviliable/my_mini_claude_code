@@ -122,26 +122,59 @@ def get_skill_loader() -> SkillLoader:
 
 @tool
 def load_skill(name: str) -> str:
-    """Load specialized knowledge by name.
+    """Load a specific skill module to gain expert knowledge for your current
+    task. Call this AFTER list_skills() when you find a relevant skill.
 
-    Skills are stored as SKILL.md files in the skills directory.
-    Each skill contains expert knowledge for specific tasks.
+    WHEN to use load_skill():
+    - After list_skills() shows a skill relevant to your task. For example,
+      if "langgraph" appears in the skill list and you are building a
+      LangGraph project, call load_skill("langgraph").
+    - Before starting implementation in a domain where you are not an expert.
+      Skills provide patterns, anti-patterns, and best practices.
+    - When you want canonical code templates instead of inventing approaches.
+
+    CONCRETE EXAMPLES:
+    - list_skills() returns "langgraph" -> load_skill("langgraph") to get
+      LangGraph state graph patterns, node design, and conditional edges.
+    - list_skills() returns "python" -> load_skill("python") to get coding
+      standards, project structure conventions, and type hint patterns.
+
+    BENEFIT: The skill content is injected into your response as XML-tagged
+    expert knowledge. You can then apply proven patterns instead of guessing.
 
     Args:
-        name: Skill name to load
+        name: Skill name from list_skills() (e.g., "langgraph", "python")
 
     Returns:
-        Skill content for use in conversation
+        Skill content wrapped in <skill> tags for use in the conversation
     """
     return get_skill_loader().load(name)
 
 
 @tool
 def list_skills() -> str:
-    """List all available skills.
+    """List all available specialized knowledge modules (skills). ALWAYS call
+    this FIRST before tackling a task in an unfamiliar domain.
+
+    WHEN to use list_skills():
+    - At the START of any task involving a specific technology, framework,
+      or domain (e.g., LangGraph, FastAPI, React, database design).
+    - Before writing code in an unfamiliar library — skills contain patterns,
+      best practices, and templates that save time and prevent mistakes.
+    - When you are unsure about the best approach — skills may contain
+      canonical patterns for common problems.
+
+    CONCRETE EXAMPLES:
+    - User asks for a LangGraph project -> list_skills() to check for
+      a "langgraph" skill, then load_skill("langgraph") if available.
+    - User asks for Python coding standards -> list_skills() to check for
+      a "python" skill with code style and project layout guidance.
+
+    BENEFIT: Skills inject expert domain knowledge directly into your context.
+    Instead of guessing at patterns, you follow proven templates.
 
     Returns:
-        Formatted list of skill names and descriptions
+        List of available skill names and their descriptions
     """
     return get_skill_loader().list_all()
 

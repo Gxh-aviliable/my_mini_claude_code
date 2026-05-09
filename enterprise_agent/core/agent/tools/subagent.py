@@ -167,18 +167,34 @@ async def _run_subagent_async(prompt: str, agent_type: str) -> str:
 
 @tool
 async def task(prompt: str, agent_type: Optional[str] = "Explore") -> str:
-    """Spawn a subagent for isolated exploration or work.
+    """Delegate work to a subagent for isolated execution. USE THIS when you
+    need another agent to handle a task independently and report back.
 
-    The subagent operates independently with limited tool access
-    and returns a summary of its work.
+    WHEN to use task():
+    - You need to search/explore a large codebase without cluttering the main
+      conversation. Use agent_type="Explore" (read-only: bash + read_file).
+    - You need a self-contained implementation task done end-to-end (plan +
+      code + test). Use agent_type="general-purpose" (read/write access).
+    - You have 3+ independent pieces of work — spawn multiple task() calls
+      for parallel execution.
 
-    Supports multi-provider: Anthropic, GLM, DeepSeek, OpenAI.
+    CONCRETE EXAMPLES:
+    - "Find all database connection patterns in this project"
+      -> task(prompt="Search for all database connection patterns and report
+         the file/line locations", agent_type="Explore")
+    - "Implement user authentication for this Flask app"
+      -> task(prompt="Implement user authentication: JWT login, registration,
+         password hashing. Read existing code first.", agent_type="general-purpose")
+
+    BENEFIT: Subagents isolate their work. You get back a summary instead of
+    every intermediate step. The main conversation stays clean and focused.
 
     Args:
-        prompt: The task prompt for the subagent
-        agent_type: Type of agent - 'Explore' (read-only) or 'general-purpose' (read/write)
+        prompt: The task prompt for the subagent (be specific about what to do)
+        agent_type: 'Explore' (read-only: bash + read_file) or
+                    'general-purpose' (bash + read_file + write_file + edit_file)
 
     Returns:
-        Summary of subagent's work
+        Summary of what the subagent did and its findings
     """
     return await _run_subagent_async(prompt, agent_type or "Explore")

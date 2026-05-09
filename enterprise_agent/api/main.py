@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse
 from enterprise_agent.api.routes.auth import router as auth_router
 from enterprise_agent.api.routes.chat import router as chat_router
 from enterprise_agent.api.routes.chat import sessions_router
+from enterprise_agent.api.routes.workspace import router as workspace_router
 from enterprise_agent.config.settings import settings
 from enterprise_agent.db.chroma import init_chroma
 from enterprise_agent.db.mysql import close_db, init_db
@@ -77,6 +78,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(chat_router)
 app.include_router(sessions_router)
+app.include_router(workspace_router)
 
 
 @app.exception_handler(Exception)
