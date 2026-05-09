@@ -67,6 +67,9 @@ Thumbs.db
 .coverage
 htmlcov/
 
+# Node.js
+node_modules/
+
 # MyPy
 .mypy_cache/
 .dmypy.json
