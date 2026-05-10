@@ -287,6 +287,98 @@ class ChromaLongTermMemory(MemoryBase):
             where={"key": key},
         )
 
+    async def update_access_count(self, doc_id: str) -> None:
+        """Update access count and last_access timestamp for a document.
+
+        Called when a memory is retrieved to track usage frequency.
+
+        Args:
+            doc_id: Document ID to update
+        """
+        try:
+            # Get current metadata
+            result = await asyncio.to_thread(
+                self.conversations.get,
+                ids=[doc_id],
+                include=["metadatas"]
+            )
+
+            if result and result.get("metadatas"):
+                meta = result["metadatas"][0].copy()
+                meta["access_count"] = meta.get("access_count", 0) + 1
+                meta["last_access"] = datetime.now(timezone.utc).isoformat()
+
+                await asyncio.to_thread(
+                    self.conversations.update,
+                    ids=[doc_id],
+                    metadatas=[meta]
+                )
+        except Exception:
+            logging.warning(f"Failed to update access count for {doc_id}", exc_info=True)
+
+    async def cleanup_low_retention(self, threshold: float = 0.1) -> int:
+        """Remove memories with retention score below threshold.
+
+        Uses decay calculator to determine retention scores based on:
+        - importance (initial value)
+        - recency (exponential decay)
+        - access frequency (logarithmic boost)
+
+        Args:
+            threshold: Minimum retention score to keep (default 0.1)
+
+        Returns:
+            Number of deleted documents
+        """
+        from enterprise_agent.memory.decay import MemoryDecayCalculator
+
+        calc = MemoryDecayCalculator()
+
+        try:
+            # Get all documents for this user
+            where_filter = {"user_id": self.user_id} if self.user_id else None
+
+            results = await asyncio.to_thread(
+                self.conversations.get,
+                where=where_filter,
+                include=["metadatas"]
+            )
+
+            if not results or not results.get("ids"):
+                return 0
+
+            ids_to_delete = []
+            for i, doc_id in enumerate(results["ids"]):
+                meta = results["metadatas"][i]
+
+                importance = meta.get("importance", 0.5)
+                timestamp = meta.get("timestamp", datetime.now(timezone.utc).isoformat())
+                access_count = meta.get("access_count", 0)
+                last_access = meta.get("last_access")
+
+                retention = calc.calculate_retention_score(
+                    importance=importance,
+                    timestamp=timestamp,
+                    access_count=access_count,
+                    last_access=last_access
+                )
+
+                if retention < threshold:
+                    ids_to_delete.append(doc_id)
+
+            if ids_to_delete:
+                await asyncio.to_thread(
+                    self.conversations.delete,
+                    ids=ids_to_delete
+                )
+                logging.info(f"Deleted {len(ids_to_delete)} low-retention memories for user {self.user_id}")
+
+            return len(ids_to_delete)
+
+        except Exception:
+            logging.warning("Failed to cleanup low retention memories", exc_info=True)
+            return 0
+
 
 # Per-user instance cache (avoids race condition on global singleton)
 _long_term_memory_cache: Dict[int, ChromaLongTermMemory] = {}

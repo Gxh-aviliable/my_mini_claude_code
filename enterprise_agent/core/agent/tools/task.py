@@ -223,9 +223,9 @@ class TodoManager:
         return any(item.get("status") != "completed" for item in self.items)
 
 
-# Per-user instances cache
+# Per-session instances cache (to prevent cross-session todo pollution)
 _task_managers: Dict[int, TaskManager] = {}
-_todo_managers: Dict[int, TodoManager] = {}
+_todo_managers: Dict[str, TodoManager] = {}  # Key is session_id, not user_id
 
 
 def get_task_manager() -> TaskManager:
@@ -238,14 +238,33 @@ def get_task_manager() -> TaskManager:
     return _task_managers[user_id]
 
 
-def get_todo_manager() -> TodoManager:
-    """Get or create TodoManager instance for current user."""
-    from enterprise_agent.core.agent.tools.workspace import get_current_user_id
-    user_id = get_current_user_id()
+def get_todo_manager(session_id: str = None) -> TodoManager:
+    """Get or create TodoManager instance for current session.
 
-    if user_id not in _todo_managers:
-        _todo_managers[user_id] = TodoManager()
-    return _todo_managers[user_id]
+    Args:
+        session_id: Session ID to get todo manager for. If None, creates empty manager.
+
+    Note: TodoManager is now per-session to prevent cross-session todo pollution.
+    Each session should have its own todo list, managed via AgentState.todos.
+    """
+    if session_id is None:
+        # Return empty manager for operations that don't need session context
+        return TodoManager()
+
+    if session_id not in _todo_managers:
+        _todo_managers[session_id] = TodoManager()
+    return _todo_managers[session_id]
+
+
+def clear_todo_manager(session_id: str) -> None:
+    """Clear TodoManager for a session.
+
+    Called when starting a new session or when todos should be reset.
+    """
+    if session_id in _todo_managers:
+        _todo_managers[session_id].items = []
+        # Optionally remove from cache entirely
+        del _todo_managers[session_id]
 
 
 # === Tool Definitions ===

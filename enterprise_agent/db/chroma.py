@@ -4,6 +4,13 @@ Provides persistent vector storage with semantic search capability.
 Uses sentence-transformers for local embedding (all-MiniLM-L6-v2).
 """
 
+import os
+
+# Set HuggingFace offline mode BEFORE importing any HF libraries
+# This prevents network requests when models are already cached
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 from pathlib import Path
 from typing import Optional
 

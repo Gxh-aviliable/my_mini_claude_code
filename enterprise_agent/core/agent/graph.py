@@ -38,6 +38,7 @@ from enterprise_agent.core.agent.nodes import (
     route_after_llm,
     route_after_tool,
     save_memory_node,
+    tool_confirm_node,
     tool_executor_node,
 )
 from enterprise_agent.core.agent.state import AgentState
@@ -85,7 +86,8 @@ def build_agent_graph():
     # Core LLM call
     graph.add_node("llm_call", llm_call_node)
 
-    # Tool execution
+    # Tool execution (with human-in-the-loop confirmation)
+    graph.add_node("tool_confirm", tool_confirm_node)
     graph.add_node("tool_executor", tool_executor_node)
     graph.add_node("save_memory", save_memory_node)
 
@@ -109,16 +111,20 @@ def build_agent_graph():
     graph.add_edge("pre_microcompact", "llm_call")      # Then call LLM
 
     # Conditional routing after LLM
+    # tool_call -> tool_confirm (human-in-the-loop check) -> tool_executor
     graph.add_conditional_edges(
         "llm_call",
         route_after_llm,
         {
-            "tool_call": "tool_executor",
+            "tool_call": "tool_confirm",  # First check for sensitive tools
+            "save_memory": "save_memory",  # Text response -> save then end
             "compress": "compress_context",
             "manual_compress": "manual_compress",
-            "end": END
         }
     )
+
+    # Tool confirmation -> tool_executor (after user approval or if no sensitive tools)
+    graph.add_edge("tool_confirm", "tool_executor")
 
     # Tool execution flow — always run microcompact before next LLM call
     graph.add_edge("tool_executor", "save_memory")
@@ -126,6 +132,7 @@ def build_agent_graph():
         "save_memory",
         route_after_tool,
         {
+            "end": END,  # Text response completed -> end
             "compress": "compress_context",
             "manual_compress": "manual_compress",
             "llm_call": "pre_microcompact"  # Run microcompact before returning to LLM
@@ -162,6 +169,7 @@ def build_simple_agent_graph():
     graph.add_node("init_context", init_context_node)
     graph.add_node("pre_microcompact", pre_llm_microcompact_node)
     graph.add_node("llm_call", llm_call_node)
+    graph.add_node("tool_confirm", tool_confirm_node)
     graph.add_node("tool_executor", tool_executor_node)
     graph.add_node("save_memory", save_memory_node)
     graph.add_node("compress_context", compress_context_node)
@@ -172,16 +180,20 @@ def build_simple_agent_graph():
     graph.add_edge("pre_microcompact", "llm_call")
 
     # Conditional routing after LLM
+    # tool_call -> tool_confirm (human-in-the-loop check) -> tool_executor
     graph.add_conditional_edges(
         "llm_call",
         route_after_llm,
         {
-            "tool_call": "tool_executor",
+            "tool_call": "tool_confirm",  # First check for sensitive tools
+            "save_memory": "save_memory",  # Text response -> save then end
             "compress": "compress_context",
             "manual_compress": END,  # Simplified: manual compress just ends
-            "end": END
         }
     )
+
+    # Tool confirmation -> tool_executor
+    graph.add_edge("tool_confirm", "tool_executor")
 
     # Tool flow — always run microcompact before next LLM call
     graph.add_edge("tool_executor", "save_memory")
@@ -189,6 +201,7 @@ def build_simple_agent_graph():
         "save_memory",
         route_after_tool,
         {
+            "end": END,  # Text response completed -> end
             "compress": "compress_context",
             "manual_compress": END,  # Simplified: manual compress just ends
             "llm_call": "pre_microcompact"  # Run microcompact before returning to LLM

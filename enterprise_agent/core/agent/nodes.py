@@ -33,18 +33,60 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langgraph.types import Command, interrupt
 
 from enterprise_agent.config.settings import settings
 from enterprise_agent.core.agent.context import get_context_manager
 from enterprise_agent.core.agent.llm_factory import get_llm
 from enterprise_agent.core.agent.state import AgentState
-from enterprise_agent.core.agent.tools import ALL_TOOLS
+from enterprise_agent.core.agent.tools import ALL_TOOLS, tool_requires_confirmation, get_sensitive_tool_info
+
+
+def _content_similarity(s1: str, s2: str) -> float:
+    """Calculate simple text similarity based on common words.
+
+    Args:
+        s1: First string
+        s2: Second string
+
+    Returns:
+        Similarity score (0-1)
+    """
+    if not s1 or not s2:
+        return 0.0
+
+    # Normalize: lowercase, split into words
+    words1 = set(s1.lower().split())
+    words2 = set(s2.lower().split())
+
+    if not words1 or not words2:
+        return 0.0
+
+    # Jaccard similarity: intersection / union
+    intersection = len(words1 & words2)
+    union = len(words1 | words2)
+
+    return intersection / union if union > 0 else 0.0
 
 # System prompts for different agent roles
 MAIN_SYSTEM_PROMPT = """You are an enterprise-grade AI assistant with access to powerful tools.
 
 ## Environment
 {environment_info}
+
+## CRITICAL: When NOT to Use Tools
+
+**Simple greetings and casual conversation do NOT require tools.**
+- If user says "你好", "hi", "hello", "你好啊" — just respond with a friendly greeting, NO tools
+- If user asks a simple question that you can answer directly — respond directly, NO tools
+- If user wants to chat or make small talk — just chat, NO tools
+
+**Only use tools when there's a clear task to accomplish:**
+- Reading/writing/editing files
+- Running shell commands
+- Searching codebase
+- Managing tasks/todos
+- Spawning subagents for complex work
 
 ## Capabilities
 - **Shell execution**: Run commands via `bash` tool
@@ -63,55 +105,19 @@ MAIN_SYSTEM_PROMPT = """You are an enterprise-grade AI assistant with access to 
   - You need parallel research, coding, or review work
   - A sub-task requires focused, isolated work
 
-## Before You Act — Tool Selection Checklist
+## Before You Act — Decision Framework
 
-Before reaching for `bash`, `write_file`, or `edit_file`, evaluate ALL of the
-following. For each question, if the answer is YES, you MUST use the indicated
-tool(s) before proceeding with manual work.
+Evaluate these questions. If YES, use the indicated tool (check tool docstring for details):
 
-1. PARALLELISM: Can this work be split into independent sub-tasks?
-   -> YES: Use `spawn_teammate()` to delegate each sub-task to a teammate
-      running in its own asyncio task. Provide a clear role and prompt.
-   -> Benefit: Multiple sub-tasks run concurrently, finishing faster.
-   -> Example: For "build a code generation and review system", spawn:
-      - spawn_teammate(name="coder", role="Code Generator", prompt="...")
-      - spawn_teammate(name="reviewer", role="Code Reviewer", prompt="...")
-      THEN use list_teammates() to check status, read_inbox() to collect results.
+1. PARALLELISM: Independent sub-tasks? -> `spawn_teammate()`
+2. SKILLS: Domain knowledge needed? -> `list_skills()` then `load_skill(name)`
+3. ISOLATED EXPLORATION: Search large codebase? -> `task(agent_type="Explore")`
+4. LONG-RUNNING: Commands > few seconds? -> `background_run()` + `check_background()`
+5. COMPLEX IMPLEMENTATION: Plan + code + review? -> `task(agent_type="general-purpose")`
 
-2. SKILLS: Is there domain-specific knowledge that would help?
-   -> YES: Call `list_skills()` first, then `load_skill(name)` for any
-      relevant skill. Skills contain patterns, best practices, and templates.
-   -> Benefit: Expert knowledge injected directly into your context.
-   -> Example: When building a LangGraph project, call list_skills() to check
-      for a langgraph skill that provides graph patterns.
-
-3. ISOLATED EXPLORATION: Do you need to search a large codebase or research
-   a question without polluting the main conversation?
-   -> YES: Use `task(prompt, agent_type="Explore")` to spawn a read-only
-      subagent. It searches independently and returns a summary.
-   -> Benefit: Keeps main conversation focused. The subagent handles noise.
-
-4. LONG-RUNNING OPERATIONS: Do any commands need to run for more than a
-   few seconds (installs, builds, large searches)?
-   -> YES: Use `background_run(command)` to start in a background thread.
-      Use `check_background(task_id)` later to retrieve results.
-   -> Benefit: You stay responsive. Background tasks run asynchronously.
-
-5. COMPLEX IMPLEMENTATION: Do you need to both plan AND write code AND
-   review it for the same feature?
-   -> YES: Use `task(prompt, agent_type="general-purpose")` to delegate the
-      full implementation to a subagent with read/write access.
-   -> Benefit: The subagent handles the full cycle; you get a clean summary.
-
-CRITICAL RULE — Multi-Agent & LangGraph Work:
-When asked to build or demonstrate multi-agent systems, graph workflows, or
-team coordination, you MUST use your actual team tools (spawn_teammate, task,
-background_run) to delegate real work. Do NOT simulate multi-agent behavior
-by writing a standalone Python script that defines agent classes. Your tools
-ARE the multi-agent system. Using them to delegate is the correct behavior.
-
-Only after you have evaluated ALL five checklist items AND used the relevant
-tools should you proceed to write files directly.
+CRITICAL: When asked to build multi-agent systems, USE your actual team tools
+(spawn_teammate, task, background_run). Do NOT simulate by writing Python scripts
+that define agent classes. Your tools ARE the multi-agent system.
 
 ## Guidelines
 1. Use tools when needed to accomplish tasks — don't just describe what to do
@@ -279,7 +285,31 @@ async def init_context_node(state: AgentState) -> Dict[str, Any]:
 
     Messages are NOT cleared here — RedisSaver automatically restores
     the previous conversation history from the checkpointer.
+
+    Memory retrieval flow:
+    1. Search user patterns first (preferences, workflows)
+    2. Search relevant conversations
+    3. Update access count for retrieved memories
     """
+    session_id = state.get("session_id", "")
+
+    # === Clear TodoManager for new sessions to prevent cross-session pollution ===
+    from enterprise_agent.core.agent.tools.task import clear_todo_manager, get_todo_manager
+    messages = state.get("messages", [])
+    is_new_session = len(messages) == 1
+
+    if is_new_session:
+        # New session: clear any leftover todos from previous sessions
+        clear_todo_manager(session_id)
+        logging.info(f"[init_context] New session {session_id}: cleared TodoManager")
+    else:
+        # Existing session: restore todos from AgentState if available
+        todos = state.get("todos", [])
+        if todos:
+            todo_mgr = get_todo_manager(session_id)
+            todo_mgr.items = todos
+            logging.info(f"[init_context] Session {session_id}: restored {len(todos)} todos from state")
+
     result = {
         "token_count": 0,
         "pending_tool_calls": [],
@@ -288,14 +318,14 @@ async def init_context_node(state: AgentState) -> Dict[str, Any]:
         "round_count": 0,
         "should_compress": False,
         "should_end": False,
+        "should_end_after_save": False,  # Reset - will be set by llm_call_node if no tool calls
         # TodoWrite nag reminder state
         "rounds_without_todo": 0,
         "used_todo_last_round": False,
         "has_open_todos": False,
     }
 
-    # === Chroma 长期记忆检索（仅新会话首条消息） ===
-    messages = state.get("messages", [])
+    # === Chroma 长期记忆检索（仅新会话首条消息）===
     user_id = state.get("user_id")
 
     # 仅当会话只有 1 条消息（全新会话的第一条用户消息）时注入
@@ -312,26 +342,51 @@ async def init_context_node(state: AgentState) -> Dict[str, Any]:
             try:
                 from enterprise_agent.memory.long_term import get_long_term_memory
                 memory = get_long_term_memory(user_id)
-                past_conversations = await memory.search_conversations(
+
+                # Step 1: 检索用户 patterns（偏好、工作流）
+                user_patterns = await memory.search_patterns(
                     query=last_user_msg,
                     n_results=3,
                 )
 
+                # Step 2: 检索相关历史对话
+                past_conversations = await memory.search_conversations(
+                    query=last_user_msg,
+                    n_results=5,
+                )
+
+                # Step 3: 更新 access count（追踪使用频率）
+                for conv in past_conversations:
+                    doc_id = conv.get("id") or conv.get("metadata", {}).get("doc_id")
+                    if doc_id:
+                        try:
+                            await memory.update_access_count(doc_id)
+                        except Exception:
+                            pass  # Non-fatal
+
+                # Format output: patterns first, then conversations
+                context_parts = []
+
+                # Patterns section
+                if user_patterns:
+                    context_parts.append("=== 用户偏好/习惯 ===")
+                    for p in user_patterns:
+                        p_type = p.get("pattern_type", "unknown")
+                        p_key = p.get("pattern_key", "")
+                        confidence = p.get("confidence", 0)
+                        context_parts.append(f"[{p_type}] {p_key} (置信度: {confidence:.2f})")
+
+                # Conversations section
                 if past_conversations:
-                    # NOTE: This system message is appended by the add_messages
-                    # reducer (AgentState.messages), ending up AFTER the current
-                    # user message. This is functionally correct because
-                    # llm_call_node passes ALL messages to the LLM, including
-                    # this context. The MAIN_SYSTEM_PROMPT is inserted at index
-                    # 0 during conversion.
-                    context_parts = []
+                    context_parts.append("\n=== 相关历史对话 ===")
                     for conv in past_conversations:
                         role = conv.get("metadata", {}).get("role", "unknown")
                         content = conv.get("content", "")
-                        if len(content) > 500:
-                            content = content[:500] + "..."
+                        if len(content) > 300:
+                            content = content[:300] + "..."
                         context_parts.append(f"[{role}]: {content}")
 
+                if context_parts:
                     context_text = "\n".join(context_parts)
                     if len(context_text) > 2000:
                         context_text = context_text[:2000] + "..."
@@ -340,7 +395,7 @@ async def init_context_node(state: AgentState) -> Dict[str, Any]:
                         "role": "user",
                         "content": (
                             "<long_term_memory>\n"
-                            "以下是与当前问题相关的历史对话记录，供参考：\n"
+                            "以下是与当前问题相关的历史记忆，供参考：\n"
                             f"{context_text}\n"
                             "</long_term_memory>"
                         )
@@ -450,11 +505,16 @@ async def llm_call_node(state: AgentState) -> Dict[str, Any]:
     round_count = state.get("round_count", 0) + 1
     logging.info(f"[llm_call] round {round_count}/{settings.MAX_AGENT_ROUNDS}")
 
+    # Determine if this should end after save_memory
+    # When there are no tool calls, the text response should end the invocation
+    should_end_after_save = not tool_calls  # True if no tool calls
+
     return {
         "messages": [response_dict],
         "pending_tool_calls": tool_calls,
         "token_count": token_count,
         "round_count": round_count,
+        "should_end_after_save": should_end_after_save,  # Signal to route_after_tool
     }
 
 
@@ -499,10 +559,12 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
     tool_map = {t.name: t for t in ALL_TOOLS}
     compress_requested = False
     used_todo = False
+    updated_todos = None  # Track todos for AgentState persistence
 
     pending = state.get("pending_tool_calls", [])
     tool_call_stats = state.get("tool_call_stats", {}).copy()  # mutable state: copy before modifying
-    logging.info(f"[tool_exec] executing {len(pending)} tool(s): {[tc.get('name') for tc in pending]}")
+    session_id = state.get("session_id", "")
+    logging.info(f"[tool_exec] Session {session_id}: executing {len(pending)} tool(s): {[tc.get('name') for tc in pending]}")
 
     for tool_call in pending:
         tool_name = tool_call.get("name")
@@ -531,6 +593,9 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
                 # Track TodoWrite usage for nag reminder
                 if tool_name == "todo_update":
                     used_todo = True
+                    # Save todos to AgentState for Redis persistence
+                    updated_todos = tool_input.get("todos", [])
+                    logging.info(f"[tool_exec] todo_update: saved {len(updated_todos)} todos to AgentState")
 
                 # Special handling for compress tool
                 if tool_name == "compress":
@@ -570,10 +635,17 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
         })
 
     # Check if there are open todos for nag reminder
-    todo_mgr = get_todo_manager()
-    has_open_todos = todo_mgr.has_open_items()
+    # Use updated_todos if available, otherwise check existing TodoManager
+    todo_mgr = get_todo_manager(session_id)
+    if updated_todos:
+        # Update TodoManager with new todos
+        todo_mgr.items = updated_todos
+        has_open_todos = todo_mgr.has_open_items()
+    else:
+        # No todo_update in this round, check existing state
+        has_open_todos = todo_mgr.has_open_items()
 
-    return {
+    result_dict = {
         "tool_results": results,
         "pending_tool_calls": [],
         "messages": tool_result_messages,
@@ -581,16 +653,26 @@ async def tool_executor_node(state: AgentState) -> Dict[str, Any]:
         "should_compress": compress_requested,  # Trigger compression if requested
         "used_todo_last_round": used_todo,
         "has_open_todos": has_open_todos,
+        "should_end_after_save": False,  # After tool execution, need to continue to next LLM call
     }
+
+    # Persist todos to AgentState (for Redis checkpoint)
+    if updated_todos:
+        result_dict["todos"] = updated_todos
+
+    return result_dict
 
 
 async def save_memory_node(state: AgentState) -> Dict[str, Any]:
-    """Save memory node - handles TodoWrite nag reminder logic.
+    """Save memory node - handles TodoWrite nag reminder logic + Chroma storage.
 
     Message persistence is handled automatically by RedisSaver checkpointer.
-    This node also injects auto-counted tool_call_stats when the agent
-    completes all todos (wrapping up), so the LLM can report accurate
-    tool usage counts instead of hallucinating.
+
+    This node also:
+    1. Evaluates importance of last conversation round
+    2. Selectively stores high-importance messages to Chroma
+    3. Extracts user patterns from very high-importance conversations
+    4. Injects auto-counted tool_call_stats when wrapping up
     """
     # === TodoWrite nag reminder mechanism (s03) ===
     used_todo = state.get("used_todo_last_round", False)
@@ -624,6 +706,144 @@ async def save_memory_node(state: AgentState) -> Dict[str, Any]:
                 f"</tool_stats>"
             )
         })
+
+    # === Chroma 长期记忆选择性存储===
+    messages = state.get("messages", [])
+    user_id = state.get("user_id")
+    session_id = state.get("session_id", "unknown")
+
+    # 找到最后一条 user消息和对应的 assistant 响应
+    last_user_msg = None
+    last_user_idx = -1
+    last_assistant_msg = None
+
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, dict):
+            role = msg.get("role", "")
+            if role == "user" and last_user_msg is None:
+                last_user_msg = msg.get("content", "")
+                last_user_idx = i
+            elif role == "assistant" and last_assistant_msg is None and last_user_idx > -1:
+                # 确保 assistant 在 user 之后
+                last_assistant_msg = msg.get("content", "")
+                break
+        elif hasattr(msg, "type"):
+            # LangChain message object
+            if msg.type == "human" and last_user_msg is None:
+                last_user_msg = _extract_text(msg.content)
+                last_user_idx = i
+            elif msg.type == "ai" and last_assistant_msg is None and last_user_idx > -1:
+                last_assistant_msg = _extract_text(msg.content)
+                break
+
+    # === 过滤系统消息（不应存储到长期记忆）===
+    def _should_skip_message(content: str) -> bool:
+        """检查是否应该跳过存储（系统生成的低价值消息）"""
+        if not content:
+            return True
+        # 跳过系统自动生成的提醒和统计
+        skip_patterns = [
+            "<reminder>",  # TodoWrite提醒
+            "<tool_stats>",  # 工具统计
+            "Update your todos",  # TodoWrite提醒内容
+            "Framework-counted tool usage",  # 工具统计内容
+        ]
+        content_lower = content.lower()
+        for pattern in skip_patterns:
+            if pattern.lower() in content_lower:
+                return True
+        # 跳过过短的消息（无实际内容）
+        if len(content.strip()) < 10:
+            return True
+        return False
+
+    if _should_skip_message(last_user_msg):
+        logging.debug(f"[save_memory] Skipped system-generated message")
+        return {"rounds_without_todo": rounds_without_todo, "messages": additional_messages}
+
+    # 如果找到了 user + assistant 对话，进行重要性评估和选择性存储
+    if last_user_msg and user_id:
+        try:
+            from enterprise_agent.memory.long_term import get_long_term_memory
+            from enterprise_agent.memory.importance import get_importance_evaluator
+
+            memory = get_long_term_memory(user_id)
+            evaluator = get_importance_evaluator()
+
+            # === 去重检查：避免存储相同内容 ===
+            recent_results = await memory.search_conversations(
+                query=last_user_msg[:50] if len(last_user_msg) > 50 else last_user_msg,
+                n_results=3,
+            )
+            for r in recent_results:
+                existing_content = r.get("content", "")
+                # 如果内容高度相似（>90%匹配），跳过存储
+                if existing_content and _content_similarity(last_user_msg, existing_content) > 0.9:
+                    logging.debug(f"[save_memory] Skipped duplicate message (similarity > 0.9)")
+                    return {"rounds_without_todo": rounds_without_todo, "messages": additional_messages}
+
+            # 评估用户消息的重要性
+            importance = await evaluator.evaluate(
+                content=last_user_msg,
+                role="user",
+                context=messages[-5:] if len(messages) >= 5 else messages,
+                enable_llm=settings.ENABLE_LLM_IMPORTANCE_EVAL,
+            )
+
+            # 选择性存储：重要性 >=阈值才存储
+            if importance >= settings.IMPORTANCE_THRESHOLD_STORE:
+                # 存储用户消息
+                await memory.store_conversation(
+                    session_id=session_id,
+                    role="user",
+                    content=last_user_msg,
+                    metadata={"importance": importance, "access_count": 0},
+                )
+
+                # 如果有 assistant 响应，也存储（重要性略低）
+                if last_assistant_msg:
+                    await memory.store_conversation(
+                        session_id=session_id,
+                        role="assistant",
+                        content=last_assistant_msg,
+                        metadata={"importance": importance * 0.8, "access_count": 0},
+                    )
+
+                logging.info(f"[save_memory] Stored conversation (importance={importance:.2f})")
+
+                # 高重要性：提取用户 pattern
+                if importance >= settings.IMPORTANCE_THRESHOLD_PATTERN and last_assistant_msg:
+                    try:
+                        from enterprise_agent.memory.pattern_extractor import get_pattern_extractor
+                        extractor = get_pattern_extractor()
+
+                        patterns = await extractor.extract_patterns_from_conversation(
+                            user_msg=last_user_msg,
+                            assistant_msg=last_assistant_msg,
+                            context=messages[-5:] if len(messages) >= 5 else messages,
+                        )
+
+                        # 存储提取的 patterns
+                        for p in patterns:
+                            await memory.store_pattern(
+                                pattern_type=p.get("type", "preference"),
+                                pattern_key=p.get("key", "unknown"),
+                                pattern_value=p.get("value", {}),
+                                confidence=p.get("confidence", 0.7),
+                            )
+
+                        if patterns:
+                            logging.info(f"[save_memory] Extracted {len(patterns)} user patterns")
+
+                    except Exception as e:
+                        logging.warning(f"Pattern extraction failed (non-fatal): {e}")
+
+            else:
+                logging.debug(f"[save_memory] Skipped low-importance message (score={importance:.2f})")
+
+        except Exception as e:
+            logging.warning(f"Chroma memory storage failed (non-fatal): {e}", exc_info=True)
 
     return {
         "rounds_without_todo": rounds_without_todo,
@@ -729,15 +949,17 @@ def route_after_llm(state: AgentState) -> str:
     """Route after LLM call based on state.
 
     Determines next node based on:
-    - Max rounds exceeded -> end
+    - Max rounds exceeded -> save_memory (will end due to round_count check in route_after_tool)
     - Has tool calls -> tool_executor
     - Exceeds token threshold -> compress_context
-    - Otherwise -> end
+    - Otherwise -> save_memory (will end due to should_end_after_save=True from llm_call_node)
+
+    Note: DO NOT modify state in routing functions - state changes must come from node returns.
     """
     # Safety valve: stop if agent has been looping too long
     if state.get("round_count", 0) >= settings.MAX_AGENT_ROUNDS:
         logging.warning(f"[route_after_llm] max rounds ({settings.MAX_AGENT_ROUNDS}) reached, ending")
-        return "end"
+        return "save_memory"  # route_after_tool will end due to round_count
 
     # Check for tool calls first
     if state.get("pending_tool_calls"):
@@ -751,18 +973,25 @@ def route_after_llm(state: AgentState) -> str:
     if state.get("token_count", 0) > settings.TOKEN_THRESHOLD:
         return "compress"
 
-    return "end"
+    # No tool calls and no compression needed -> save memory then end
+    # llm_call_node already set should_end_after_save=True
+    return "save_memory"
 
 
 def route_after_tool(state: AgentState) -> str:
-    """Route after tool execution.
+    """Route after save_memory (from tool_executor or text response).
 
-    After tools run, we check if:
+    After save_memory runs, we check if:
+    - should_end_after_save is set -> end (text response completed)
     - Max rounds exceeded -> end
     - Manual compression was requested via compress tool
     - Auto compression threshold exceeded
     before going back to LLM.
     """
+    # Check if this was a text response that should end
+    if state.get("should_end_after_save"):
+        return "end"
+
     # Safety valve: stop if agent has been looping too long
     if state.get("round_count", 0) >= settings.MAX_AGENT_ROUNDS:
         logging.warning(f"[route_after_tool] max rounds ({settings.MAX_AGENT_ROUNDS}) reached, ending")
@@ -826,3 +1055,122 @@ async def check_inbox_node(state: AgentState) -> Dict[str, Any]:
         }
 
     return {}
+
+
+async def tool_confirm_node(state: AgentState) -> Dict[str, Any]:
+    """Confirm sensitive tool executions before proceeding.
+
+    Uses LangGraph interrupt() to pause execution and wait for user approval.
+    Returns state updates to either proceed with execution or reject.
+
+    CRITICAL: Non-sensitive tools always pass through without confirmation.
+    Only sensitive tools need user approval. The final pending_tool_calls
+    contains: non_sensitive_tools + approved_sensitive_tools.
+
+    LangGraph interrupt behavior:
+    - First call: interrupt() pauses execution, waits for resume
+    - After resume: node re-executes from start, interrupt() returns resume data
+    """
+    pending = state.get("pending_tool_calls", [])
+
+    if not pending:
+        return {}
+
+    # Split tools into sensitive (needs confirmation) and non-sensitive (pass through)
+    sensitive_tools = []
+    non_sensitive_tools = []
+    for tc in pending:
+        tool_name = tc.get("name", "")
+        if tool_requires_confirmation(tool_name):
+            sensitive_tools.append(tc)
+        else:
+            non_sensitive_tools.append(tc)
+
+    # No sensitive tools -> proceed directly to tool_executor
+    if not sensitive_tools:
+        logging.info(f"[tool_confirm] No sensitive tools in {len(pending)} pending calls, proceeding")
+        return {}
+
+    # Confirmation disabled -> proceed with all tools
+    if not settings.ENABLE_TOOL_CONFIRMATION:
+        logging.info(f"[tool_confirm] Confirmation disabled, proceeding with {len(sensitive_tools)} sensitive tools")
+        return {}
+
+    # Build interrupt request for sensitive tools only
+    tool_descriptions = []
+    for tc in sensitive_tools:
+        tool_name = tc.get("name", "")
+        tool_args = tc.get("args", {})
+        desc = get_sensitive_tool_info(tool_name, tool_args)
+        tool_descriptions.append({
+            "id": tc.get("id", ""),
+            "name": tool_name,
+            "args": tool_args,
+            "description": desc,
+        })
+
+    # Call interrupt() - will pause on first call, return resume data after resume
+    # IMPORTANT: After resume, this node re-executes from start, and interrupt()
+    # returns the resume data directly (no second pause)
+    user_response = interrupt({
+        "type": "tool_confirmation",
+        "tools": tool_descriptions,
+        "message": f"Confirm execution of {len(sensitive_tools)} sensitive tool(s)?",
+    })
+
+    # ========== Only executed AFTER resume (user responded) ==========
+    logging.info(f"[tool_confirm] User response received: approved={user_response.get('approved')}, approved_ids={user_response.get('approved_ids', [])}")
+
+    approved = user_response.get("approved", False)
+    approved_ids = user_response.get("approved_ids", [])
+
+    if approved:
+        # Build final pending_tool_calls:
+        # 1. All non-sensitive tools (always pass through)
+        # 2. Approved sensitive tools
+        final_pending = non_sensitive_tools.copy()
+
+        if approved_ids:
+            # Partial approval: add only approved sensitive tools
+            for tc in sensitive_tools:
+                if tc.get("id") in approved_ids:
+                    final_pending.append(tc)
+            logging.info(f"[tool_confirm] Partial approval: {len(final_pending)}/{len(pending)} tools proceeding (non-sensitive: {len(non_sensitive_tools)}, approved sensitive: {len(approved_ids)})")
+        else:
+            # Full approval (no specific IDs): add all sensitive tools
+            final_pending.extend(sensitive_tools)
+            logging.info(f"[tool_confirm] Full approval: {len(final_pending)} tools proceeding (non-sensitive: {len(non_sensitive_tools)}, all sensitive approved)")
+
+        return {"pending_tool_calls": final_pending}
+    else:
+        # Rejected: clear all pending tools and inform LLM
+        # API requirement: every tool_use must have a corresponding tool_result
+        logging.info(f"[tool_confirm] User rejected {len(sensitive_tools)} sensitive tools, clearing all {len(pending)} pending")
+
+        # Build tool_result for ALL pending tools (satisfies API requirement)
+        tool_result_messages = []
+        for tc in pending:
+            tool_id = tc.get("id", "")
+            tool_name = tc.get("name", "")
+            tool_result_messages.append({
+                "role": "tool",
+                "content": f"Tool execution rejected by user. The '{tool_name}' tool was not executed.",
+                "tool_call_id": tool_id
+            })
+
+        # Add user message explaining rejection
+        tool_result_messages.append({
+            "role": "user",
+            "content": (
+                "<tool_rejected>\n"
+                f"User rejected execution of {len(sensitive_tools)} sensitive tool(s):\n"
+                + "\n".join(f"- {tc['name']}: {get_sensitive_tool_info(tc['name'], tc.get('args', {}))}" for tc in sensitive_tools)
+                + "\nPlease modify your approach or ask user for clarification.\n"
+                "</tool_rejected>"
+            )
+        })
+
+        return {
+            "pending_tool_calls": [],
+            "messages": tool_result_messages
+        }

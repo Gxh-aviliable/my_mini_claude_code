@@ -36,6 +36,10 @@ def _get_deepseek_llm() -> BaseChatModel:
 
     Uses ChatAnthropic for the Anthropic-compatible endpoint
     (/anthropic) or ChatOpenAI for the OpenAI-compatible endpoint.
+
+    Note: DeepSeek thinking models (deepseek-v4-pro) have long response times
+    during thinking generation, so timeout is increased to 300 seconds.
+    Also disables SDK internal retries to prevent duplicate retry logic.
     """
     base_url = settings.get_effective_base_url() or ""
 
@@ -46,6 +50,8 @@ def _get_deepseek_llm() -> BaseChatModel:
             model=settings.get_effective_model_id(),
             api_key=settings.get_effective_api_key(),
             base_url=base_url,
+            timeout=300,  # DeepSeek thinking models need longer timeout
+            max_retries=0,  # Disable SDK retries, let langchain handle it
         )
 
     from langchain_openai import ChatOpenAI
@@ -54,6 +60,8 @@ def _get_deepseek_llm() -> BaseChatModel:
         model=settings.get_effective_model_id(),
         api_key=settings.get_effective_api_key(),
         base_url=base_url,
+        request_timeout=300,  # OpenAI SDK timeout
+        max_retries=0,
     )
 
 

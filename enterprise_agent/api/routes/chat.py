@@ -6,11 +6,12 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
+from langgraph.types import Command
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from enterprise_agent.api.middleware.auth import get_current_user
-from enterprise_agent.api.schemas.chat import ChatRequest, ChatResponse, SessionCreate, SessionResponse
+from enterprise_agent.api.schemas.chat import ChatRequest, ChatResponse, ResumeRequest, SessionCreate, SessionResponse
 from enterprise_agent.config.settings import settings
 from enterprise_agent.core.agent.graph import get_agent_graph
 from enterprise_agent.core.agent.tools.workspace import set_current_user_id
@@ -32,6 +33,16 @@ def _extract_delta(content) -> str:
                 parts.append(block.text)
         return "".join(parts)
     return str(content) if content else ""
+
+
+def _extract_content_from_message(msg) -> str:
+    """Extract text content from a message object or dict."""
+    if isinstance(msg, dict):
+        content = msg.get("content", "")
+        return _extract_delta(content) if content else ""
+    elif hasattr(msg, "content"):
+        return _extract_delta(msg.content) if msg.content else ""
+    return str(msg) if msg else ""
 
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -131,63 +142,249 @@ async def chat_stream(
     request: ChatRequest,
     user_id: int = Depends(get_current_user)
 ):
-    """Streaming chat completion (SSE)
+    """Streaming chat completion (SSE) with interrupt support.
+
+    Uses astream(stream_mode="updates") to detect interrupts from tool_confirm_node.
 
     Args:
         request: Chat request
         user_id: Current user ID from JWT
 
     Returns:
-        StreamingResponse with SSE events
+        StreamingResponse with SSE events (delta, tool_start, tool_end, interrupt)
     """
     session_id = request.session_id or str(uuid.uuid4())
-
-    # Set user context for workspace isolation
     set_current_user_id(user_id)
 
+    config = {"configurable": {"thread_id": session_id}}
+    graph = get_agent_graph()
+
     async def generate():
-        streamed_text = False
         try:
-            # Stream agent execution with thread_id for state persistence
-            async for event in get_agent_graph().astream_events(
+            # Use astream with stream_mode="updates" to support interrupt detection
+            async for update in graph.astream(
                 {
                     "session_id": session_id,
                     "user_id": user_id,
                     "messages": [{"role": "user", "content": request.content}]
                 },
-                config={"configurable": {"thread_id": session_id}},
-                version="v2"
+                config=config,
+                stream_mode="updates"
             ):
-                kind = event.get("event", "")
-                if kind == "on_chat_model_stream":
-                    chunk = event.get("data", {}).get("chunk")
-                    if chunk and hasattr(chunk, "content") and chunk.content:
-                        delta = _extract_delta(chunk.content)
-                        if delta:
-                            streamed_text = True
-                            yield f"data: {json.dumps({'delta': delta})}\n\n"
-                elif kind == "on_chat_model_end":
-                    # Fallback: if no streaming deltas were emitted (e.g. ainvoke
-                    # without streaming support), send the full output at end.
-                    if not streamed_text:
-                        output = event.get("data", {}).get("output")
-                        if output and hasattr(output, "content") and output.content:
-                            text = _extract_delta(output.content)
-                            if text:
-                                yield f"data: {json.dumps({'delta': text})}\n\n"
-                elif kind == "on_tool_start":
-                    yield f"data: {json.dumps({'event': 'tool_start', 'name': event.get('name', '')})}\n\n"
-                elif kind == "on_tool_end":
-                    yield f"data: {json.dumps({'event': 'tool_end', 'name': event.get('name', '')})}\n\n"
-                elif kind == "on_chain_error":
-                    err_msg = str(event.get("data", {}).get("error", "Unknown chain error"))
-                    logging.error("Chain error in stream: %s", err_msg)
-                    yield f"data: {json.dumps({'error': err_msg})}\n\n"
+                # Check for interrupt (from tool_confirm_node)
+                if "__interrupt__" in update:
+                    interrupt_obj = update["__interrupt__"]
+                    logging.info(f"[stream] Interrupt detected: {type(interrupt_obj)} - {interrupt_obj}")
 
+                    # Extract interrupt value - handle various Interrupt formats
+                    # LangGraph returns: (Interrupt(value=...),) tuple format
+                    interrupt_data = None
+
+                    # Debug: check what type we actually received
+                    logging.debug(f"[stream] Checking tuple: isinstance={isinstance(interrupt_obj, tuple)}, len={len(interrupt_obj) if hasattr(interrupt_obj, '__len__') else 'N/A'}")
+
+                    # Handle tuple format: (Interrupt(value=...),)
+                    if isinstance(interrupt_obj, tuple):
+                        if len(interrupt_obj) > 0:
+                            first_item = interrupt_obj[0]
+                            logging.debug(f"[stream] First item type: {type(first_item)}, hasattr value: {hasattr(first_item, 'value')}")
+                            if hasattr(first_item, 'value'):
+                                interrupt_data = first_item.value
+                                logging.debug(f"[stream] Extracted value from Interrupt.value: {interrupt_data}")
+                            elif isinstance(first_item, dict):
+                                interrupt_data = first_item
+                        else:
+                            interrupt_data = {}
+                    # Handle single Interrupt object
+                    elif hasattr(interrupt_obj, 'value') and not isinstance(interrupt_obj, tuple):
+                        interrupt_data = interrupt_obj.value
+                    # Handle dict format
+                    elif isinstance(interrupt_obj, dict):
+                        interrupt_data = interrupt_obj
+                    # Handle list format
+                    elif isinstance(interrupt_obj, list) and len(interrupt_obj) > 0:
+                        first_item = interrupt_obj[0]
+                        if hasattr(first_item, 'value'):
+                            interrupt_data = first_item.value
+                        else:
+                            interrupt_data = interrupt_obj
+                    # Last resort: try to parse the string representation
+                    else:
+                        # If it looks like a string representation of Interrupt tuple
+                        str_repr = str(interrupt_obj)
+                        logging.warning(f"[stream] Could not extract interrupt data, raw: {str_repr[:200]}")
+                        interrupt_data = {"raw": str_repr}
+
+                    # Ensure interrupt_data is JSON-serializable (dict or list)
+                    if not isinstance(interrupt_data, (dict, list)):
+                        logging.warning(f"[stream] interrupt_data is not dict/list: {type(interrupt_data)}, converting")
+                        interrupt_data = {"raw": str(interrupt_data)}
+
+                    logging.info(f"[stream] Final interrupt_data: {interrupt_data}")
+                    yield f"data: {json.dumps({'event': 'interrupt', 'data': interrupt_data}, ensure_ascii=False)}\n\n"
+                    # After sending interrupt, the stream ends gracefully
+                    # Frontend should call /stream/resume to continue
+                    # GeneratorExit will be raised when we return, but this is normal behavior
+                    return
+
+                # Process normal node updates
+                for node_name, node_output in update.items():
+                    if node_name == "__interrupt__":
+                        continue
+
+                    # Handle LLM call output
+                    if node_name == "llm_call":
+                        messages = node_output.get("messages", [])
+                        if messages:
+                            last_msg = messages[-1]
+                            content = _extract_content_from_message(last_msg)
+                            if content:
+                                yield f"data: {json.dumps({'delta': content}, ensure_ascii=False)}\n\n"
+
+                    # Handle tool executor output
+                    elif node_name == "tool_executor":
+                        tool_results = node_output.get("tool_results", {})
+                        pending_tools = node_output.get("pending_tool_calls", [])
+
+                        # Send tool_start events for pending tools
+                        for tc in pending_tools:
+                            tool_name = tc.get("name", "")
+                            yield f"data: {json.dumps({'event': 'tool_start', 'name': tool_name}, ensure_ascii=False)}\n\n"
+
+                        # Send tool results
+                        for tool_id, result in tool_results.items():
+                            result_str = str(result)
+                            if len(result_str) > 200:
+                                result_str = result_str[:200] + "..."
+                            yield f"data: {json.dumps({'event': 'tool_result', 'id': tool_id, 'result': result_str}, ensure_ascii=False)}\n\n"
+
+                    # Handle tool confirm node (when confirmation is disabled)
+                    elif node_name == "tool_confirm":
+                        # This node doesn't produce output when disabled
+                        pass
+
+            yield "data: [DONE]\n\n"
+        except GeneratorExit:
+            # GeneratorExit is normal when stream ends early (interrupt or client disconnect)
+            # Don't log as error - this is expected behavior for SSE streams
+            logging.debug(f"[stream] Generator closed (normal for interrupt/client disconnect)")
             yield "data: [DONE]\n\n"
         except Exception as e:
             logging.exception("Stream error: %s", e)
-            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+
+@router.post("/stream/resume")
+async def chat_stream_resume(
+    session_id: str,
+    approved: bool,
+    body: ResumeRequest = None,
+    user_id: int = Depends(get_current_user)
+):
+    """Resume SSE stream after interrupt confirmation.
+
+    Called by frontend when user approves/rejects tool execution.
+    Uses Command(resume=...) to continue the interrupted graph.
+
+    Args:
+        session_id: Session/thread ID (from query param)
+        approved: Whether user approved the tool(s)
+        body: Resume request with approved_ids list
+        user_id: Current user ID from JWT
+
+    Returns:
+        StreamingResponse with continued SSE events
+    """
+    set_current_user_id(user_id)
+
+    approved_ids = body.approved_ids if body else []
+
+    config = {"configurable": {"thread_id": session_id}}
+    graph = get_agent_graph()
+
+    async def generate():
+        try:
+            logging.info(f"[stream/resume] Session {session_id}: approved={approved}, approved_ids={approved_ids}")
+
+            # Resume execution with user's decision
+            async for update in graph.astream(
+                Command(resume={"approved": approved, "approved_ids": approved_ids or []}),
+                config=config,
+                stream_mode="updates"
+            ):
+                # Check for another interrupt (multiple tool confirmations)
+                if "__interrupt__" in update:
+                    interrupt_obj = update["__interrupt__"]
+                    logging.info(f"[stream/resume] Another interrupt: {interrupt_obj}")
+
+                    # Extract interrupt value - handle tuple format: (Interrupt(value=...),)
+                    interrupt_data = None
+
+                    if isinstance(interrupt_obj, tuple):
+                        if len(interrupt_obj) > 0:
+                            first_item = interrupt_obj[0]
+                            if hasattr(first_item, 'value'):
+                                interrupt_data = first_item.value
+                            elif isinstance(first_item, dict):
+                                interrupt_data = first_item
+                        else:
+                            interrupt_data = {}
+                    elif hasattr(interrupt_obj, 'value') and not isinstance(interrupt_obj, tuple):
+                        interrupt_data = interrupt_obj.value
+                    elif isinstance(interrupt_obj, dict):
+                        interrupt_data = interrupt_obj
+                    elif isinstance(interrupt_obj, list) and len(interrupt_obj) > 0:
+                        first_item = interrupt_obj[0]
+                        if hasattr(first_item, 'value'):
+                            interrupt_data = first_item.value
+                        else:
+                            interrupt_data = interrupt_obj
+
+                    if interrupt_data is None or not isinstance(interrupt_data, (dict, list)):
+                        interrupt_data = {"raw": str(interrupt_obj)}
+
+                    yield f"data: {json.dumps({'event': 'interrupt', 'data': interrupt_data}, ensure_ascii=False)}\n\n"
+                    return  # Wait for another confirmation
+
+                # Process normal node updates
+                for node_name, node_output in update.items():
+                    if node_name == "__interrupt__":
+                        continue
+
+                    # Handle LLM call output
+                    if node_name == "llm_call":
+                        messages = node_output.get("messages", [])
+                        if messages:
+                            last_msg = messages[-1]
+                            content = _extract_content_from_message(last_msg)
+                            if content:
+                                yield f"data: {json.dumps({'delta': content}, ensure_ascii=False)}\n\n"
+
+                    # Handle tool executor output
+                    elif node_name == "tool_executor":
+                        tool_results = node_output.get("tool_results", {})
+                        pending_tools = node_output.get("pending_tool_calls", [])
+
+                        for tc in pending_tools:
+                            tool_name = tc.get("name", "")
+                            yield f"data: {json.dumps({'event': 'tool_start', 'name': tool_name}, ensure_ascii=False)}\n\n"
+
+                        for tool_id, result in tool_results.items():
+                            result_str = str(result)
+                            if len(result_str) > 200:
+                                result_str = result_str[:200] + "..."
+                            yield f"data: {json.dumps({'event': 'tool_result', 'id': tool_id, 'result': result_str}, ensure_ascii=False)}\n\n"
+
+            yield "data: [DONE]\n\n"
+        except GeneratorExit:
+            # GeneratorExit is normal when stream ends early (interrupt or client disconnect)
+            logging.debug(f"[stream/resume] Generator closed (normal for interrupt/client disconnect)")
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            logging.exception("Stream resume error: %s", e)
+            yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
@@ -296,3 +493,89 @@ async def delete_session(
     await db.commit()
 
     return {"message": "Session deleted"}
+
+
+# === Human-in-the-loop Tool Confirmation ===
+
+@router.post("/confirm")
+async def confirm_tool(
+    session_id: str,
+    approved: bool,
+    approved_ids: list[str] = None,
+    user_id: int = Depends(get_current_user)
+):
+    """Handle tool confirmation response from frontend.
+
+    Resumes execution after user approves/rejects sensitive tool(s).
+
+    Args:
+        session_id: Session/thread ID
+        approved: Whether user approved the tool(s)
+        approved_ids: List of approved tool call IDs (optional, for partial approval)
+
+    Returns:
+        Status indicating execution resumed
+    """
+    from langgraph.types import Command
+
+    set_current_user_id(user_id)
+
+    config = {"configurable": {"thread_id": session_id}}
+    graph = get_agent_graph()
+
+    # Resume execution with user's decision
+    # The interrupt() in tool_confirm_node will receive this as user_response
+    result = await graph.invoke(
+        Command(resume={"approved": approved, "approved_ids": approved_ids or []}),
+        config
+    )
+
+    logging.info(f"[confirm] Session {session_id}: approved={approved}, approved_ids={approved_ids}")
+
+    return {"status": "resumed", "session_id": session_id, "approved": approved}
+
+
+@router.get("/pending_confirm/{session_id}")
+async def get_pending_confirmation(
+    session_id: str,
+    user_id: int = Depends(get_current_user)
+):
+    """Get pending tool confirmation request for a session.
+
+    Returns the current interrupt state if a tool confirmation is pending.
+
+    Args:
+        session_id: Session/thread ID
+        user_id: Current user ID
+
+    Returns:
+        Pending confirmation details or empty if none pending
+    """
+    config = {"configurable": {"thread_id": session_id}}
+    graph = get_agent_graph()
+
+    # Get current state to check for pending interrupts
+    state = await graph.get_state(config)
+
+    # Check if there's a pending interrupt for tool confirmation
+    tasks = state.tasks
+    pending_confirm = None
+
+    for task in tasks:
+        if task.interrupts:
+            for interrupt_data in task.interrupts:
+                if isinstance(interrupt_data, dict) and interrupt_data.get("type") == "tool_confirmation":
+                    pending_confirm = interrupt_data
+                    break
+
+    if pending_confirm:
+        return {
+            "status": "pending",
+            "session_id": session_id,
+            "confirmation": pending_confirm
+        }
+    else:
+        return {
+            "status": "no_pending",
+            "session_id": session_id
+        }

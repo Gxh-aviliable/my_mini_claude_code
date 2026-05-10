@@ -34,3 +34,8 @@ class SessionResponse(BaseModel):
     status: str
     created_at: datetime
     message_count: Optional[int] = 0
+
+
+class ResumeRequest(BaseModel):
+    """Resume request after tool confirmation"""
+    approved_ids: List[str] = Field(default_factory=list)

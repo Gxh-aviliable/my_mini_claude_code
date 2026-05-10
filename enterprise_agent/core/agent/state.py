@@ -34,6 +34,7 @@ class AgentState(TypedDict):
     round_count: int  # LLM调用轮次计数，防止无限循环
     should_compress: bool
     should_end: bool
+    should_end_after_save: bool  # 标记：文本响应完成后应该结束（由 llm_call_node 设置）
 
     # TodoWrite nag reminder (s03)
     rounds_without_todo: int  # 计数：连续多少轮没有使用TodoWrite

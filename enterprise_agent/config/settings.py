@@ -1,5 +1,13 @@
+import os
 from pathlib import Path
 from typing import Optional
+
+# Clear system environment variables that may override .env config
+# ANTHROPIC_AUTH_TOKEN is set by Claude Code CLI and overrides .env values
+# When using custom LLM providers (DeepSeek, GLM, etc.), this causes authentication issues
+if os.getenv("ANTHROPIC_BASE_URL") or os.getenv("LLM_BASE_URL"):
+    # User is using a custom LLM endpoint, remove Claude Code's auth token
+    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 from pydantic import model_validator
 from pydantic_settings import BaseSettings
@@ -83,7 +91,31 @@ class Settings(BaseSettings):
     # Embedding (for Chroma)
     EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"  # Local sentence-transformers model
 
-    model_config = {"env_file": ".env", "case_sensitive": True, "extra": "ignore"}
+    # Memory Enhancement (Chroma long-term memory)
+    IMPORTANCE_THRESHOLD_STORE: float = 0.5  # 低于此值不存储到 Chroma（提高阈值避免存储低价值信息）
+    IMPORTANCE_THRESHOLD_PATTERN: float = 0.7  # 高于此值提取用户 pattern（提高阈值确保高质量）
+    MEMORY_DECAY_LAMBDA: float = 0.1  # 衰减系数（0.1 = ~7天衰减50%）
+    MEMORY_CLEANUP_THRESHOLD: float = 0.1  # 留存分数低于此值则清理
+    MEMORY_CLEANUP_INTERVAL_HOURS: int = 1  # 清理任务间隔（小时）
+    ENABLE_LLM_IMPORTANCE_EVAL: bool = True  # 是否启用 LLM 重要性评估
+    IMPORTANCE_EVAL_MODEL: str = "deepseek-chat"  # 重要性评估使用的模型
+
+    # Output Verification (trust but verify - prevent hallucination)
+    ENABLE_EDIT_VERIFICATION: bool = True  # Auto re-read after edit_file
+    ENABLE_WRITE_VERIFICATION: bool = True  # Auto re-read after write_file
+    VERIFICATION_PREVIEW_LINES: int = 10  # Lines to show in verification preview
+
+    # Human-in-the-loop confirmation (sensitive tool execution)
+    # SSE + interrupt integration now supported via astream(stream_mode="updates")
+    ENABLE_TOOL_CONFIRMATION: bool = True  # Enable tool confirmation with SSE interrupt support
+    SENSITIVE_TOOLS_LIST: list[str] = ["bash", "write_file", "edit_file", "task_create", "spawn_teammate", "send_message", "broadcast"]  # Tools requiring confirmation
+    CONFIRMATION_TIMEOUT_SECONDS: int = 300  # Timeout for user confirmation (5 minutes)
+
+    model_config = {
+        "env_file": str(Path(__file__).resolve().parent.parent.parent / ".env"),
+        "case_sensitive": True,
+        "extra": "ignore"
+    }
 
     @model_validator(mode="after")
     def validate_security(self):

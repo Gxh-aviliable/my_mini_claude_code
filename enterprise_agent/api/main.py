@@ -45,10 +45,16 @@ async def lifespan(app: FastAPI):
     await setup_checkpointer()
     logger.info("Redis checkpointer ready")
 
+    # Memory decay cleanup task
+    from enterprise_agent.memory.decay import get_or_start_cleanup_task
+    cleanup_task = get_or_start_cleanup_task()
+    logger.info("Memory decay cleanup task started")
+
     logger.info("Application startup complete")
     yield
     # Shutdown
     logger.info("Shutting down...")
+    cleanup_task.cancel()  # Stop memory cleanup task
     await close_db()
     await close_redis()
 

@@ -51,31 +51,11 @@ IDLE_TIMEOUT_SECONDS = 60
 POLL_INTERVAL_SECONDS = 5
 MAX_WORK_ROUNDS = 50
 
-# System prompt template for team agents
-TEAMMATE_SYSTEM_PROMPT_TEMPLATE = """You are '{name}', a teammate agent with role: {role}.
+# System prompt template for team agents (concise version)
+TEAMMATE_SYSTEM_PROMPT_TEMPLATE = """You are '{name}' (role: {role}). Part of a multi-agent team.
 
-## Identity
-- Your name: {name}
-- Your role: {role}
-- You are part of a multi-agent team coordinated by the lead agent
-
-## Capabilities
-- Execute tasks using available tools (bash, file operations, etc.)
-- Communicate with teammates via message passing
-- Auto-claim unclaimed tasks during idle phase
-
-## Team Collaboration
-- **Inbox**: Check your inbox for messages from teammates or the lead
-- **Send messages**: Use `send_message` tool to communicate with specific teammates
-- **Idle**: Call `idle` tool when you finish your current work to enter idle phase
-- **Task claiming**: During idle phase, you will auto-claim unclaimed tasks
-
-## Guidelines
-1. Complete your assigned work thoroughly
-2. Report progress and results back to the lead agent
-3. When done with a task, call `idle` to signal availability
-4. Be concise in communications
-5. If you encounter blockers, message the lead agent for guidance"""
+Focus on your role. Use available tools as needed. Report progress to lead.
+When done, call `idle()` to signal availability. Check inbox for messages."""
 
 
 class AsyncMessageBus:
@@ -736,40 +716,27 @@ def get_plan_manager() -> PlanApprovalManager:
 
 @tool
 async def spawn_teammate(name: str, role: str, prompt: str) -> str:
-    """Spawn a persistent autonomous teammate that runs in its own asyncio task
-    with its own LangGraph loop, tools, and inbox. USE THIS when you need TRUE
-    multi-agent collaboration — not simulation.
+    """Spawn an autonomous teammate with its own asyncio task, tools, and inbox.
 
-    WHEN to use spawn_teammate():
-    - You need multiple agents working concurrently on different sub-tasks.
-      Each teammate runs independently and communicates via inbox messages.
-    - You need specialized roles: a "Coder" teammate, a "Reviewer" teammate,
-      a "Tester" teammate, all working in parallel on the same project.
-    - The task is too large for one agent — split it across teammates.
+    Use for TRUE multi-agent collaboration (not simulation). Each teammate
+    runs independently and communicates via message passing.
 
-    CONCRETE EXAMPLES:
-    - "Build a code review system":
-      1. spawn_teammate(name="coder", role="Code Generator",
-         prompt="Generate a Python REST API with Flask for user management")
-      2. spawn_teammate(name="reviewer", role="Code Reviewer",
-         prompt="Review the code written by 'coder'. Check for bugs, style,
-         and security issues. Send feedback via send_message.")
-      3. Use list_teammates() to check status, read_inbox() for their messages.
-    - "Research three different database options":
-      Spawn 3 teammates, each researching one option, then collect their
-      findings via read_inbox().
+    Use when: (1) Multiple agents working concurrently on different sub-tasks
+              (2) Specialized roles: coder, reviewer, tester working in parallel
+              (3) Task too large for one agent — split across teammates
 
-    BENEFIT: True parallelism. Each teammate has its own LLM context and tool
-    access. They communicate via structured messages, not shared memory. Use
-    send_message(), read_inbox(), and broadcast() to coordinate.
+    Example:
+        spawn_teammate("coder", "Code Generator", "Build Flask REST API")
+        spawn_teammate("reviewer", "Code Reviewer", "Review coder's output")
+        # Then: list_teammates() for status, read_inbox() for messages
 
     Args:
-        name: Unique name for this teammate (e.g., "coder", "reviewer")
-        role: Role description the teammate will follow
-        prompt: Detailed work prompt explaining what the teammate should do
+        name: Unique name (e.g., "coder", "reviewer")
+        role: Role description
+        prompt: Work prompt for the teammate
 
     Returns:
-        Confirmation message with the teammate's name and initial status
+        Confirmation with teammate's name and status
     """
     tm = get_teammate_manager()
     return await tm.spawn(name, role, prompt)

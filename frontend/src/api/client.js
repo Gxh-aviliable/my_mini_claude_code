@@ -79,7 +79,7 @@ export async function sendMessage({ session_id, content }) {
   return data
 }
 
-export function streamMessage({ session_id, content, onDelta, onToolStart, onToolEnd, onError, onDone }) {
+export function streamMessage({ session_id, content, onDelta, onToolStart, onToolEnd, onInterrupt, onError, onDone }) {
   const token = getToken()
   console.log('[stream] Starting stream, session:', session_id, 'content:', content.slice(0, 50))
 
@@ -138,6 +138,14 @@ export function streamMessage({ session_id, content, onDelta, onToolStart, onToo
             } else if (json.event === 'tool_end') {
               console.log('[stream] Tool end:', json.name)
               onToolEnd(json.name)
+            } else if (json.event === 'tool_result') {
+              console.log('[stream] Tool result:', json.id)
+            } else if (json.event === 'interrupt') {
+              // Interrupt received - tool confirmation required
+              console.log('[stream] Interrupt received:', json.data)
+              onInterrupt(json.data)
+              // Stop current stream, wait for user confirmation
+              return
             } else if (json.error) {
               console.error('[stream] Error event:', json.error)
               onError(json.error)
@@ -155,6 +163,86 @@ export function streamMessage({ session_id, content, onDelta, onToolStart, onToo
     onDone()
   }).catch(err => {
     console.error('[stream] Fetch error:', err)
+    onError(err.message)
+  })
+}
+
+// Resume stream after interrupt confirmation
+export function resumeStream({ session_id, approved, approved_ids, onDelta, onToolStart, onToolEnd, onInterrupt, onError, onDone }) {
+  const token = getToken()
+  console.log('[resume] Resuming stream, session:', session_id, 'approved:', approved)
+
+  // Build URL with query params
+  let url = `${BASE}/chat/stream/resume?session_id=${encodeURIComponent(session_id)}&approved=${approved}`
+
+  fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({ approved_ids: approved_ids || [] })
+  }).then(async (res) => {
+    console.log('[resume] Response status:', res.status)
+
+    if (!res.ok) {
+      let errText = 'Resume failed'
+      try {
+        const err = await res.json()
+        errText = err.detail || errText
+      } catch {}
+      console.error('[resume] HTTP error:', errText)
+      onError(errText)
+      return
+    }
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buffer = ''
+
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) {
+        console.log('[resume] Stream ended')
+        break
+      }
+      const chunk = decoder.decode(value, { stream: true })
+      buffer += chunk
+      const lines = buffer.split('\n')
+      buffer = lines.pop() || ''
+      for (const line of lines) {
+        if (line.startsWith('data: ')) {
+          const payload = line.slice(6)
+          if (payload === '[DONE]') {
+            console.log('[resume] Received [DONE]')
+            onDone()
+            return
+          }
+          try {
+            const json = JSON.parse(payload)
+            if (json.delta !== undefined) {
+              onDelta(json.delta)
+            } else if (json.event === 'tool_start') {
+              onToolStart(json.name)
+            } else if (json.event === 'tool_end') {
+              onToolEnd(json.name)
+            } else if (json.event === 'interrupt') {
+              // Another interrupt (multiple tool confirmations)
+              console.log('[resume] Another interrupt:', json.data)
+              onInterrupt(json.data)
+              return
+            } else if (json.error) {
+              onError(json.error)
+            }
+          } catch (e) {
+            console.warn('[resume] Failed to parse SSE data:', payload)
+          }
+        }
+      }
+    }
+    onDone()
+  }).catch(err => {
+    console.error('[resume] Fetch error:', err)
     onError(err.message)
   })
 }

@@ -68,6 +68,88 @@ from enterprise_agent.core.agent.tools.team import (
     spawn_teammate,
 )
 
+# === Human-in-the-loop: Sensitive Tools ===
+# These tools require user confirmation before execution
+SENSITIVE_TOOLS = {
+    "bash",           # Shell commands (delete, modify files, etc.)
+    "write_file",     # Write/create files
+    "edit_file",      # Edit existing files
+    "task_create",    # Create background tasks
+    "spawn_teammate", # Spawn subagent
+    "send_message",   # Send message to teammate
+    "broadcast",      # Broadcast to all teammates
+}
+
+# Read-only tools that never require confirmation
+SAFE_TOOLS = {
+    "read_file",
+    "list_skills",
+    "list_teammates",
+    "list_transcripts",
+    "get_transcript",
+    "context_status",
+    "check_background",
+    "read_inbox",
+    "task_list",
+    "task_get",
+    "todo_update",  # Task tracking is safe
+}
+
+
+def tool_requires_confirmation(tool_name: str) -> bool:
+    """Check if tool requires user confirmation before execution.
+
+    Args:
+        tool_name: Name of the tool
+
+    Returns:
+        True if tool requires confirmation
+    """
+    return tool_name in SENSITIVE_TOOLS
+
+
+def get_sensitive_tool_info(tool_name: str, tool_args: dict) -> str:
+    """Get human-readable description of sensitive tool action.
+
+    Args:
+        tool_name: Name of the tool
+        tool_args: Tool arguments
+
+    Returns:
+        Human-readable description for confirmation dialog
+    """
+    if tool_name == "bash":
+        cmd = tool_args.get("command", "")
+        # Truncate long commands
+        if len(cmd) > 100:
+            cmd = cmd[:100] + "..."
+        return f"Execute shell command: `{cmd}`"
+    elif tool_name == "write_file":
+        path = tool_args.get("path", "")
+        content_preview = tool_args.get("content", "")[:50]
+        return f"Write file: `{path}` (content: {content_preview}...)"
+    elif tool_name == "edit_file":
+        path = tool_args.get("path", "")
+        old = tool_args.get("old_text", "")[:30]
+        new = tool_args.get("new_text", "")[:30]
+        return f"Edit file: `{path}` (replace `{old}` with `{new}`)"
+    elif tool_name == "task_create":
+        desc = tool_args.get("description", "")
+        return f"Create background task: {desc[:50]}..."
+    elif tool_name == "spawn_teammate":
+        role = tool_args.get("role", "")
+        return f"Spawn teammate agent: {role}"
+    elif tool_name == "send_message":
+        to = tool_args.get("to", "")
+        msg = tool_args.get("message", "")[:50]
+        return f"Send message to {to}: {msg}..."
+    elif tool_name == "broadcast":
+        msg = tool_args.get("message", "")[:50]
+        return f"Broadcast to all teammates: {msg}..."
+    else:
+        return f"Execute {tool_name}"
+
+
 # === Tool Registry ===
 
 ALL_TOOLS = [
